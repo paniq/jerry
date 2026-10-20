@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""tom — Multimodal Attachment Processor.
+
+Reads files, base64-encodes binaries, and wraps each payload with a unique
+<jerry:HEXD> tag pair. jerry scans the resulting stream for these tags and
+constructs a proper multimodal content array.
+
+    echo "what's in this image?" | ./tom - pic1.png pic2.jpg
+    ./tom intro.txt - photo.png
+"""
+
+import base64
+import os
+import random
+import sys
+
+PROG = "tom"
+VERSION = "1.0.0"
+
+EXIT_OK, EXIT_USAGE = 0, 1
+
+# Text extensions that are treated as plain text (no base64 encoding)
+TEXT_EXTS = {".txt", ".md"}
+
+
+def eprint(*args, **kwargs):
+    kwargs.setdefault("file", sys.stderr)
+    print(*args, **kwargs)
+
+
+def random_tag_id():
+    """Generate a 12-character hex string."""
+    return "".join(random.choices("0123456789abcdef", k=12))
+
+
+def is_text_file(path):
+    """Determine if a file should be treated as text."""
+    _, ext = os.path.splitext(path)
+    return ext.lower() in TEXT_EXTS
+
+
+def detect_mime(path):
+    """Detect MIME type from file extension."""
+    _, ext = os.path.splitext(path)
+    ext = ext.lower()
+    mime_map = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".gif": "image/gif",
+        ".webp": "image/webp",
+        ".bmp": "image/bmp",
+        ".svg": "image/svg+xml",
+        ".pdf": "application/pdf",
+        ".txt": "text/plain",
+        ".md": "text/markdown",
+    }
+    return mime_map.get(ext, "application/octet-stream")
+
+
+def process_file(path):
+    """Process a single file and return (is_attachment, tag_id, payload) or None for stdin passthrough."""
+    if path == "-":
+        # Stdin: pass through verbatim, no wrapping
+        return None
+
+    tag_id = random_tag_id()
+    is_text = is_text_file(path)
+
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read()
+    except OSError as exc:
+        eprint("%s: cannot read %s: %s" % (PROG, path, exc))
+        sys.exit(EXIT_USAGE)
+
+    if is_text:
+        payload = raw.decode("utf-8", errors="replace")
+        return (False, tag_id, payload)
+    else:
+        # Binary: base64-encode
+        mime = detect_mime(path)
+        encoded = base64.b64encode(raw).decode("ascii")
+        payload = "data:%s;base64,%s" % (mime, encoded)
+        return (True, tag_id, payload)
+
+
+def format_payload(is_attachment, tag_id, payload):
+    """Format a payload with the tag brackets."""
+    return "<jerry:%s>%s</jerry:%s>" % (tag_id, payload, tag_id)
+
+
+def main():
+    args = sys.argv[1:]
+
+    if not args:
+        eprint("%s: no files specified" % PROG)
+        return EXIT_USAGE
+
+    for path in args:
+        result = process_file(path)
+        if result is None:
+            # Stdin passthrough
+            stdin_data = sys.stdin.read()
+            sys.stdout.write(stdin_data)
+            sys.stdout.flush()
+        else:
+            is_attachment, tag_id, payload = result
+            output = format_payload(is_attachment, tag_id, payload)
+            sys.stdout.write(output)
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

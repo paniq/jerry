@@ -1,0 +1,557 @@
+#!/usr/bin/env python3
+"""jerry — To (Large Language) Module.
+
+A single-shot, pipe friendly client for a llama.cpp server:
+
+    cat instructions.txt | jerry        # fresh session, prints the raw response
+    echo hello! tell me a story | jerry # same, the piped text is what is sent
+
+The session is empty apart from the text it is given, the model is run until it
+returns control to the user, and the raw response is printed on stdout.
+"""
+
+import argparse
+import base64
+import json
+import os
+import random
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
+
+PROG = "jerry"
+VERSION = "1.0.0"
+
+DEFAULT_URL = os.environ.get("JERRY_URL") or "http://localhost:8080"
+DEFAULT_SEED = int(os.environ.get("JERRY_SEED", "0"))
+DEFAULT_LIMIT = 32768
+DEFAULT_TIMEOUT = float(os.environ.get("JERRY_TIMEOUT", "600"))
+
+EXIT_OK, EXIT_USAGE, EXIT_SERVER, EXIT_LIMIT, EXIT_KILLED = 0, 1, 2, 3, 130
+
+EPILOG = """\
+exit codes: 0 ok, 1 usage error, 2 server error, 3 output limit reached, 130 interrupted
+
+environment:
+  TOM_URL        server to talk to             (default http://localhost:8080)
+  TOM_MODEL      model name to send            (default: whatever the server reports)
+  TOM_SEED       default seed                  (default 0)
+
+examples:
+  cat instructions.txt | jerry
+  echo hello! tell me a story | jerry
+  cat instructions.txt | jerry -v -r
+  jerry -s "tell me a story"                 # random seed, one off answer
+  jerry -s 1234 "tell me a story"            # the same story every time
+"""
+
+
+def eprint(*args, **kwargs):
+    kwargs.setdefault("file", sys.stderr)
+    print(*args, **kwargs)
+
+
+def log(args, msg):
+    """Diagnostic line, only printed with -v."""
+    if args.verbose:
+        eprint("%s: %s" % (PROG, msg))
+
+
+def report(args, msg):
+    """Problem line, printed unless -q."""
+    if not args.quiet:
+        eprint("%s: %s" % (PROG, msg))
+
+
+# --------------------------------------------------------------------------- #
+# arguments
+# --------------------------------------------------------------------------- #
+
+class Parser(argparse.ArgumentParser):
+    """argparse exits 2 on usage errors, which jerry documents as a server error;
+    usage errors are exit code 1."""
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        self.exit(EXIT_USAGE, "%s: error: %s\n" % (self.prog, message))
+
+
+def parse_args(argv):
+    ap = Parser(
+        prog=PROG,
+        description=__doc__.split("\n\n")[0],
+        epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument("prompt", nargs="*", help="text to send (used when stdin is not piped)")
+
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="diagnostics and a progress meter on stderr")
+    ap.add_argument("-r", "--reason", action="store_true",
+                    help="print the model's reasoning to stderr")
+    ap.add_argument("-f", "--fast", action="store_true",
+                    help="disable reasoning")
+    ap.add_argument("-b", "--big", action="store_true",
+                    help="do not limit the output at all (default limit: %d tokens)" % DEFAULT_LIMIT)
+    ap.add_argument("-e", "--echo", action="store_true",
+                    help="do not clip the input from the output, print both as one")
+
+    ap.add_argument("-s", "--seed", nargs="?", type=int, const=None, default=DEFAULT_SEED,
+                    help="seed, fixed by default so the same input can give the same output "
+                         "(on servers that honour it); no argument picks a random one")
+
+    # extras
+    ap.add_argument("-i", "--input", help="read the text from a file ('-' for stdin)")
+    ap.add_argument("-o", "--output", help="write the response to a file instead of stdout")
+    ap.add_argument("-S", "--system", action="store_true",
+                    help="send the text as a system message instead of a user message")
+    ap.add_argument("-u", "--url", default=DEFAULT_URL, help="server url (default %s)" % DEFAULT_URL)
+    ap.add_argument("-m", "--model", default=os.environ.get("JERRY_MODEL"), help="model name")
+    ap.add_argument("-t", "--timeout", type=float, default=DEFAULT_TIMEOUT,
+                    help="socket timeout in seconds (default %d)" % DEFAULT_TIMEOUT)
+    ap.add_argument("--limit", type=int, help="explicit output token limit, overrides the default")
+    ap.add_argument("--no-stream", action="store_true", help="do not stream (no live progress meter)")
+    ap.add_argument("-q", "--quiet", action="store_true", help="no error messages either")
+    ap.add_argument("--version", action="version", version="%s %s" % (PROG, VERSION))
+
+    return ap.parse_args(argv)
+
+
+# --------------------------------------------------------------------------- #
+# input
+# --------------------------------------------------------------------------- #
+
+def read_input(args):
+    if args.input:
+        if args.input == "-":
+            return sys.stdin.read()
+        with open(args.input, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    if args.prompt:
+        return " ".join(args.prompt)
+    if not sys.stdin.isatty():
+        return sys.stdin.read()
+    return ""
+
+
+# Regex for well-formed <jerry:HEXD> tags
+_TAG_RE = re.compile(r"<jerry:([0-9a-f]{12})>(.*?)</jerry:\1>")
+
+
+def parse_multimodal(text):
+    """Detect <jerry:TAG>...</jerry:TAG> tags and build a content array.
+
+    Returns a list of content entries (text and image_url objects) if at least
+    one well-formed tag pair is found, otherwise returns None to signal
+    passthrough as plain string content.
+    """
+    # Check for at least one well-formed tag
+    if not _TAG_RE.search(text):
+        return None
+
+    content = []
+    last_end = 0
+
+    for match in _TAG_RE.finditer(text):
+        # Text segment before this tag
+        if match.start() > last_end:
+            prefix = text[last_end:match.start()]
+            if prefix:
+                content.append({"type": "text", "text": prefix})
+
+        payload = match.group(2)
+        if payload.startswith("data:"):
+            content.append({"type": "image_url", "image_url": {"url": payload}})
+        else:
+            # Non-data tag payload treated as text
+            if payload:
+                content.append({"type": "text", "text": payload})
+
+        last_end = match.end()
+
+    # Trailing text after last tag
+    if last_end < len(text):
+        suffix = text[last_end:]
+        if suffix:
+            content.append({"type": "text", "text": suffix})
+
+    return content if content else None
+
+
+def build_messages(args, text):
+    multimodal = parse_multimodal(text)
+    if multimodal is not None:
+        return [{"role": "system" if args.system else "user", "content": multimodal}]
+    return [{"role": "system" if args.system else "user", "content": text}]
+
+
+# --------------------------------------------------------------------------- #
+# progress meter (stderr, -v only)
+# --------------------------------------------------------------------------- #
+
+class Meter:
+    """Progress on stderr, only with -v.
+
+    On a terminal the meter owns stderr and rewrites its own line, so the
+    response (and -r reasoning) is printed once the run is over, otherwise the
+    meter prints one line per update and everything is streamed live.
+    """
+
+    def __init__(self, args, limit):
+        self.args = args
+        self.limit = limit
+        self.tty = sys.stderr.isatty()
+        # on a terminal the meter owns stderr: nothing else is mixed into its line
+        self.clean = self.tty and args.verbose
+        self.tokens = 0
+        self.start = time.monotonic()
+        self.first = None
+        self.phase = "prompt"
+        self.last = 0.0
+        self.dirty = False
+
+    def set_phase(self, name):
+        self.phase = name
+        self.render()
+
+    def tick(self, n=1):
+        self.tokens += n
+        if n and self.first is None:
+            self.first = time.monotonic() - self.start
+        self.dirty = True
+        now = time.monotonic()
+        if self.tty and now - self.last >= (0.25 if self.clean else 1.0):
+            self.render()
+            self.last = now
+
+    def render(self, finish=""):
+        if not self.args.verbose:
+            return
+        elapsed = time.monotonic() - self.start
+        rate = self.tokens / elapsed if elapsed else 0.0
+        if self.limit:
+            head = "jerry: %d/%d %5.1f%%" % (self.tokens, self.limit, 100.0 * self.tokens / self.limit)
+        else:
+            head = "jerry: %d tokens (no limit)" % self.tokens
+        line = "%s %5.1f t/s %5.1fs %s%s" % (head, rate, elapsed, self.phase, finish)
+        sys.stderr.write(("\r" if self.clean else "") + line + ("" if self.clean else "\n"))
+        sys.stderr.flush()
+        self.dirty = False
+
+    def done(self, finish="stop"):
+        if self.args.verbose and self.dirty:
+            self.render(finish)
+            if self.clean:
+                sys.stderr.write("\n")
+                sys.stderr.flush()
+            self.dirty = False
+
+
+# --------------------------------------------------------------------------- #
+# output
+# --------------------------------------------------------------------------- #
+
+def silence_stdout():
+    """The reader hung up. Point stdout at /dev/null so the flush the interpreter
+    does at exit cannot fail again (that is what produced exit code 120 and the
+    'Exception ignored' message on stderr)."""
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        os.close(devnull)
+    except (OSError, ValueError):
+        pass
+
+
+class Out:
+    """stdout (or -o FILE). `hold` keeps everything until the end so that a -v
+    meter on a terminal is not broken up by the response."""
+
+    def __init__(self, args, hold=False):
+        self.hold = hold
+        self.fh = open(args.output, "w", encoding="utf-8") if args.output else sys.stdout
+        self.wrote = ""
+        self.pending = ""
+
+    def write(self, text):
+        if not text:
+            return
+        self.pending += text
+        self.wrote += text
+        if not self.hold:
+            try:
+                self.fh.write(text)
+                self.fh.flush()
+            except BrokenPipeError:
+                silence_stdout()
+                raise
+
+    def flush(self):
+        if self.hold and self.pending:
+            try:
+                self.fh.write(self.pending)
+                self.fh.flush()
+            except BrokenPipeError:
+                silence_stdout()
+                raise
+            self.pending = ""
+
+    def close(self):
+        try:
+            self.flush()
+            if self.fh is not sys.stdout:
+                self.fh.close()
+            else:
+                sys.stdout.flush()
+        except BrokenPipeError:
+            silence_stdout()
+
+
+# --------------------------------------------------------------------------- #
+# server
+# --------------------------------------------------------------------------- #
+
+def server_report(args, message):
+    report(args, message)
+    return EXIT_SERVER
+
+
+def http_json(args, path):
+    try:
+        with urllib.request.urlopen(args.url.rstrip("/") + path, timeout=args.timeout) as resp:
+            return json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception:
+        return None
+
+
+def model_name(args):
+    if args.model:
+        return args.model
+    data = http_json(args, "/v1/models")
+    if data and data.get("data"):
+        return data["data"][0].get("id")
+    return "local-model"
+
+
+def build_payload(args, messages, seed):
+    limit = 0 if args.big else (args.limit if args.limit is not None else DEFAULT_LIMIT)
+    payload = {"messages": messages, "stream": not args.no_stream, "seed": seed}
+    if args.model:
+        payload["model"] = args.model
+    if limit:
+        payload["max_tokens"] = limit
+    if args.fast:
+        # not in the OpenAI protocol, but this is what llama.cpp chat templates use;
+        # harmless on servers that ignore it
+        payload["enable_thinking"] = False
+    return payload, limit
+
+
+def finish_code(args, finish, limit):
+    if finish == "length":
+        report(args, "output limit reached (%s tokens), the response is incomplete; "
+                     "use -b for no limit or --limit N" % limit)
+        return EXIT_LIMIT
+    if finish in ("tool_calls", "tool_case"):
+        report(args, "the model requested a tool call, jerry has no tools to run; stopping")
+        return EXIT_SERVER
+    return EXIT_OK
+
+
+def new_data():
+    return {"content": "", "reasoning": "", "tool_calls": [], "finish": "",
+            "usage": {}, "timings": {}}
+
+
+def take(args, part, data, meter, out, flush=False):
+    """Handle one delta, or a whole message when not streaming.
+
+    Live output only happens when stderr is not owned by the meter; otherwise
+    everything is accumulated and printed once the run is over.
+    """
+    reasoning = part.get("reasoning_content") or part.get("reasoning") or ""
+    content = part.get("content") or ""
+    calls = part.get("tool_calls") or []
+
+    if reasoning:
+        data["reasoning"] += reasoning
+        meter.tick(1 if not flush else max(1, len(reasoning) // 4))
+        if args.reason and not meter.clean:
+            eprint(reasoning, end="" if not flush else "\n")
+
+    if content:
+        data["content"] += content
+        meter.tick(1 if not flush else max(1, len(content) // 4))
+        out.write(content)
+
+    for call in calls:
+        fn = call.get("function", call)
+        data["tool_calls"].append({"name": fn.get("name"), "arguments": fn.get("arguments")})
+        meter.tick(1)
+
+
+def run(args, payload, limit, meter, out):
+    """One generation: the whole session, until the model hands control back."""
+    url = args.url.rstrip("/") + "/v1/chat/completions"
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
+    )
+
+    try:
+        resp = urllib.request.urlopen(request, timeout=args.timeout)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace").strip()
+        try:
+            detail = json.loads(detail).get("error", {}).get("message", detail)
+        except ValueError:
+            pass
+        return server_report(args, "http %s: %s" % (exc.code, detail))
+    except (urllib.error.URLError, OSError) as exc:
+        return server_report(args, "cannot reach %s: %s" % (url, exc))
+
+    result = new_data()
+
+    if "event-stream" in (resp.headers.get("Content-Type") or ""):
+        meter.set_phase("streaming")
+        for raw in resp:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line or line.startswith(":"):              # sse comment / keep-alive
+                continue
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data)
+            except ValueError:
+                log(args, "skipped unparsable chunk: %s" % data)
+                continue
+            for choice in chunk.get("choices") or []:
+                part = choice.get("delta") or choice.get("message") or {}
+                take(args, part, result, meter, out)
+                if choice.get("finish_reason"):
+                    result["finish"] = choice["finish_reason"]
+            result["usage"] = chunk.get("usage") or result["usage"]
+            result["timings"] = chunk.get("timings") or result["timings"]
+            if limit and meter.tokens > limit:
+                report(args, "the server sent more than the agreed limit (%d tokens)" % limit)
+                result["finish"] = "length"
+                break
+        resp.close()
+    else:
+        meter.set_phase("response")
+        try:
+            doc = json.loads(resp.read().decode("utf-8", "replace"))
+        except ValueError as exc:
+            return server_report(args, "unparsable response: %s" % exc)
+        result["usage"] = doc.get("usage", {})
+        result["timings"] = doc.get("timings", {})
+        choice = (doc.get("choices") or [{}])[0]
+        part = choice.get("message") or choice.get("delta") or {}
+        take(args, part, result, meter, out, flush=True)
+        result["finish"] = choice.get("finish_reason") or "stop"
+
+    return result
+
+
+# --------------------------------------------------------------------------- #
+# main
+# --------------------------------------------------------------------------- #
+def summary(args, meter, data):
+    """Final numbers, on stderr, only with -v."""
+    usage = data.get("usage") or {}
+    timings = data.get("timings") or {}
+    log(args, "finish  %s" % (data.get("finish") or "stop"))
+    if usage.get("prompt_tokens"):
+        log(args, "prompt  %d tokens %s" % (
+            usage["prompt_tokens"],
+            "(%.1f t/s)" % (1000.0 * usage["prompt_tokens"] / timings["prompt_ms"])
+            if timings.get("prompt_ms") else ""))
+    if usage.get("completion_tokens"):
+        log(args, "output  %d tokens %s first token %s" % (
+            usage["completion_tokens"],
+            "(%.1f t/s)" % (1000.0 * usage["completion_tokens"] / timings["predicted_ms"])
+            if timings.get("predicted_ms") else "",
+            "%.2fs" % meter.first if meter.first is not None else "n/a"))
+    elif meter.tokens:
+        log(args, "output  %d tokens (estimated)" % meter.tokens)
+    if data.get("reasoning") and not args.reason:
+        log(args, "reasoning %d chars, use -r to see it" % len(data["reasoning"]))
+
+
+def main(argv=None):
+    args = parse_args(argv)
+
+    text = read_input(args)
+    if not text.strip():
+        report(args, "nothing to send: pipe text on stdin, use -i FILE, or pass it as an argument")
+        return EXIT_USAGE
+
+    seed_is_random = args.seed is None
+    seed = random.randint(0, 2 ** 31 - 1) if seed_is_random else args.seed
+    messages = build_messages(args, text)
+    payload, limit = build_payload(args, messages, seed)
+
+    meter = Meter(args, limit)
+    out = Out(args, hold=meter.clean)
+
+    try:
+        if args.verbose:
+            log(args, "server  %s" % args.url)
+            log(args, "model   %s" % model_name(args))
+            log(args, "seed    %d%s" % (seed, " (random)" if seed_is_random else ""))
+            log(args, "limit   %s tokens" % ("none (-b)" if not limit else limit))
+            log(args, "reasoning %s" % ("off (-f)" if args.fast else "hidden"))
+            log(args, "input   %d chars as %s message" % (len(text), "system" if args.system else "user"))
+
+        # -e: the input is not clipped from the output, both are printed as one
+        if args.echo:
+            out.write(text if text.endswith("\n") else text + "\n")
+            out.write("\n")
+
+        meter.set_phase("prompt")
+        data = run(args, payload, limit, meter, out)
+        if isinstance(data, int):
+            return data
+
+        meter.done(data["finish"] or "stop")
+
+        # when the meter owns stderr, everything is printed once the run is over
+        if meter.clean and args.reason and data["reasoning"]:
+            eprint(data["reasoning"])
+
+        for call in data["tool_calls"]:
+            out.write("\n%s(%s)\n" % (call["name"], call["arguments"]))
+        if out.wrote and not out.wrote.endswith("\n"):
+            out.write("\n")
+        out.flush()
+
+        if args.verbose:
+            summary(args, meter, data)
+
+        return finish_code(args, data["finish"] or "stop", limit)
+    except BrokenPipeError:
+        meter.done("stopped")
+        return EXIT_OK
+    except KeyboardInterrupt:
+        meter.done("interrupted")
+        report(args, "interrupted")
+        return EXIT_KILLED
+    finally:
+        out.close()
+        if meter.dirty and meter.clean:
+            sys.stderr.write("\n")
+            sys.stderr.flush()
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        silence_stdout()
+        sys.exit(EXIT_OK)
