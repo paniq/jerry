@@ -1,6 +1,6 @@
 # jerry — a pipe to llama.cpp
 
-`jerry` is a single-shot, pipe-friendly Python client for a [llama.cpp](https://github.com/ggerml llama.cpp) server. It sends your input through a fresh session, waits for the model to finish, and prints the raw response on **stdout**.
+`jerry` is a single-shot, pipe-friendly Python client for a [llama.cpp](https://github.com/ggml-org/llama.cpp) server. It sends your input through a fresh session, waits for the model to finish, and prints the raw response on **stdout**.
 
 ```sh
 cat instructions.txt | jerry                  # fresh session, raw response on stdout
