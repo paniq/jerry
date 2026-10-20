@@ -3,7 +3,7 @@
 `jerry` is a single-shot, pipe-friendly Python client for a [llama.cpp](https://github.com/ggml-org/llama.cpp) server. It sends your input through a fresh session, waits for the model to finish, and prints the raw response on **stdout**.
 
 ```sh
-cat instructions.txt | jerry                  # fresh session, raw response on stdout
+cat instructions.txt | jerry                    # fresh session, raw response on stdout
 echo "hello! tell me a story" | jerry           # the piped text is the prompt
 jerry "tell me a story"                         # same, positional argument
 ```
@@ -29,7 +29,7 @@ sudo cp jerry /usr/local/bin/
 
 ```sh
 echo "what's 2+2?" | jerry
-jerry -S "You are a helpful assistant."   # system message
+jerry -S "You are a helpful assistant."    # system message
 jerry -i prompt.txt                        # read prompt from file
 jerry -o response.txt "hello"              # write response to file
 ```
