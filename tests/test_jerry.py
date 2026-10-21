@@ -36,7 +36,7 @@ from importlib import util as importlib_util
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-TOM = os.path.join(ROOT, "jerry")
+JERRY = os.path.join(ROOT, "jerry")
 README = os.path.join(ROOT, "README.md")
 
 sys.path.insert(0, HERE)
@@ -102,7 +102,7 @@ def load_jerry(env=None):
         if env:
             os.environ.update(env)
         name = "jerry_under_test"
-        loader = importlib_machinery.SourceFileLoader(name, TOM)
+        loader = importlib_machinery.SourceFileLoader(name, JERRY)
         spec = importlib_util.spec_from_loader(name, loader)
         mod = importlib_util.module_from_spec(spec)
         loader.exec_module(mod)
@@ -162,7 +162,7 @@ class Run:
         self.out_read_fd, out_w = os.pipe()
         nonblock(self.out_read_fd)
 
-        self.proc = subprocess.Popen([TOM] + self.args, stdin=in_r, stdout=out_w, stderr=err_w,
+        self.proc = subprocess.Popen([JERRY] + self.args, stdin=in_r, stdout=out_w, stderr=err_w,
                                      cwd=ROOT, env=self.env)
         for fd in (err_w, out_w):
             os.close(fd)
@@ -245,7 +245,7 @@ class Run:
 class TestReadmeSpec(unittest.TestCase):
 
     def test_exit_codes_documented_in_help(self):
-        r = subprocess.run([TOM, "--help"], capture_output=True, text=True)
+        r = subprocess.run([JERRY, "--help"], capture_output=True, text=True)
         for code in (0, 1, 2, 3, 130):
             self.assertIn(" %d " % code, r.stdout, "help should list exit code %d" % code)
 
@@ -253,18 +253,18 @@ class TestReadmeSpec(unittest.TestCase):
         with open(README) as fh:
             flags = re.findall(r"^\| `(-{1,2}[A-Za-z-]+)", fh.read(), re.M)
         self.assertTrue(flags, "no flags found in the README option table")
-        r = subprocess.run([TOM, "--help"], capture_output=True, text=True)
+        r = subprocess.run([JERRY, "--help"], capture_output=True, text=True)
         for flag in flags:
             self.assertIn(flag, r.stdout, "%s is documented in the README but missing from --help" % flag)
 
     def test_documented_defaults(self):
-        r = subprocess.run([TOM, "--help"], capture_output=True, text=True)
+        r = subprocess.run([JERRY, "--help"], capture_output=True, text=True)
         self.assertIn("http://localhost:8080", r.stdout)
         self.assertIn("32768", r.stdout)
         self.assertIn("600", r.stdout)
 
     def test_stock_python3_standard_library_only(self):
-        with open(TOM) as fh:
+        with open(JERRY) as fh:
             src = fh.read()
         self.assertEqual(src.splitlines()[0], "#!/usr/bin/env python3")
         mods = set(re.findall(r"^(?:import|from)\s+([A-Za-z_][A-Za-z0-9_.]*)", src, re.M))
@@ -274,17 +274,17 @@ class TestReadmeSpec(unittest.TestCase):
                           "%s is not standard library" % mod)
 
     def test_no_client_side_response_cache(self):
-        with open(TOM) as fh:
+        with open(JERRY) as fh:
             self.assertNotIn("cache", fh.read().lower())
 
     def test_no_shell_and_no_prompt_decoration(self):
-        with open(TOM) as fh:
+        with open(JERRY) as fh:
             src = fh.read()
         self.assertNotIn("subprocess", src)
         self.assertNotIn("sh -c", src)
 
     def test_only_the_standard_llama_cpp_endpoints_are_used(self):
-        with open(TOM) as fh:
+        with open(JERRY) as fh:
             src = fh.read()
         paths = set(re.findall(r'"(/v1/[A-Za-z0-9_/]*)"', src))
         self.assertEqual(paths, {"/v1/chat/completions", "/v1/models"},
@@ -365,7 +365,7 @@ class TestReadmeSpec(unittest.TestCase):
 # what jerry sends
 # --------------------------------------------------------------------------- #
 
-class TestWhatTomSends(unittest.TestCase):
+class TestWhatJerrySends(unittest.TestCase):
 
     def test_seed_is_sent_on_every_request(self):
         payload, _ = JERRY_MOD.build_payload(JERRY_MOD.parse_args([]), [{"role": "user", "content": "x"}], 0)
@@ -484,7 +484,7 @@ class TestLive(LiveCase):
         self.assertNotIn("```", text)
 
     def test_composes_with_a_pipe(self):
-        p = subprocess.run("echo '%s' | %s" % (PROMPT, TOM), shell=True, capture_output=True,
+        p = subprocess.run("echo '%s' | %s" % (PROMPT, JERRY), shell=True, capture_output=True,
                            cwd=ROOT, timeout=TIMEOUT, env=dict(os.environ, JERRY_URL=SERVER))
         self.assertEqual(p.returncode, EXIT_OK)
         self.assertTrue(p.stdout.strip())
@@ -603,7 +603,7 @@ class TestLive(LiveCase):
     def test_broken_pipe_exits_cleanly_and_silently(self):
         """README: stderr is nothing by default; the documented exit codes apply."""
         r, w = os.pipe()
-        proc = subprocess.Popen([TOM, LONG], stdin=subprocess.PIPE, stdout=w,
+        proc = subprocess.Popen([JERRY, LONG], stdin=subprocess.PIPE, stdout=w,
                                 stderr=subprocess.PIPE, cwd=ROOT,
                                 env=dict(os.environ, JERRY_URL=SERVER))
         os.close(w)
@@ -630,7 +630,7 @@ class TestLive(LiveCase):
 
     def test_keyboard_interrupt_exits_130(self):
         prompt = "write a two hundred word story about a key"
-        proc = subprocess.Popen([TOM, "-v", prompt], stdin=subprocess.PIPE,
+        proc = subprocess.Popen([JERRY, "-v", prompt], stdin=subprocess.PIPE,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=ROOT,
                                 env=dict(os.environ, JERRY_URL=SERVER))
         proc.stdin.write((prompt + "\n").encode())

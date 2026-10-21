@@ -75,13 +75,29 @@ tom photo1.png prompt.md photo2.jpg | jerry
 | `-S`, `--system` | Send text as a system message instead of user |
 | `-u`, `--url` URL | Server URL, default `http://localhost:8080` |
 | `-m`, `--model` NAME | Model name to send |
-| `-t`, `--timeout` S | Socket timeout in seconds, default 600 |
+| `-t`, `--timeout` S | Socket timeout in seconds, default 600 (`JERRY_TIMEOUT`) |
 | `--limit` N | Explicit output token limit (overrides the default) |
 | `--no-stream` | Do not stream the response (no live meter) |
 | `-q`, `--quiet` | Suppress error messages too |
 | `--version` | Print version and exit |
 
 **Input sources**, in order of precedence: `-i FILE` → positional argument → stdin.
+
+---
+
+## Environment
+
+Every default above can be set from the environment, so a server you use every day only has to be
+configured once:
+
+| Variable | Default for | Fallback |
+| --- | --- | --- |
+| `JERRY_URL` | `-u`, `--url` | `http://localhost:8080` |
+| `JERRY_MODEL` | `-m`, `--model` | whatever the server reports |
+| `JERRY_SEED` | `-s`, `--seed` | `0` |
+| `JERRY_TIMEOUT` | `-t`, `--timeout` | `600` |
+
+An option given on the command line always wins over the environment.
 
 ---
 
@@ -167,11 +183,7 @@ There is no client-side response cache: the only cache in play is the server's o
 
 ## Testing
 
-```sh
-python3 tests/test_jerry.py                  # bundled mock server
-python3 tests/test_jerry.py --server URL     # test against a real server
-python3 tests/test_jerry.py -k pipe          # run a subset
-```
+See [tests/README.md](tests/README.md).
 
 ---
 

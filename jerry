@@ -35,9 +35,10 @@ EPILOG = """\
 exit codes: 0 ok, 1 usage error, 2 server error, 3 output limit reached, 130 interrupted
 
 environment:
-  TOM_URL        server to talk to             (default http://localhost:8080)
-  TOM_MODEL      model name to send            (default: whatever the server reports)
-  TOM_SEED       default seed                  (default 0)
+  JERRY_URL      server to talk to             (default http://localhost:8080)
+  JERRY_MODEL    model name to send            (default: whatever the server reports)
+  JERRY_SEED     default seed                  (default 0)
+  JERRY_TIMEOUT  socket timeout in seconds     (default 600)
 
 examples:
   cat instructions.txt | jerry
