@@ -1,13 +1,12 @@
-# tools
+# Tools
 
-`jerry` has no tools of its own. It takes them from a python module you give it:
+`jerry` has no built-in tools. Instead, it loads them from Python modules you provide:
 
 ```sh
 echo "what is the weather in Paris?" | jerry -T tools/weather.py -v
 ```
 
-Every function in that module whose name begins with `tool_` is a tool. Everything
-else in the module is left alone, so a tool module can have its own helpers.
+Every top-level function in the module whose name starts with `tool_` becomes a tool. Everything else is left alone, so a tool module can freely define helper functions.
 
 ```python
 def tool_get_weather(city: str, units: str = "c") -> str:
@@ -24,61 +23,67 @@ def tool_list_cities() -> list[str]:
     ...
 ```
 
-Nothing else has to be written: the metadata sent to the server is read from the
-declaration itself.
+No additional metadata is needed — `jerry` reads everything from the function signature and docstring.
 
-| where it comes from | what is sent |
-| --- | --- |
-| the function name | the tool name, `tool_` dropped |
-| the first block of the docstring | the tool description |
-| the `Args:` block | the description of each parameter |
-| the annotation | the JSON Schema type (see below) |
-| a parameter with no default | `required` |
-| a default value | `default`, and the parameter is not required |
+## Parameter Mapping
 
-`*args` and `**kwargs` are not parameters and are not sent.
+| Source               | Tool metadata produced  |
+| -------------------- | ----------------------- |
+| Function name        | Tool name (`tool_` prefix removed) |
+| First docstring block | Tool description        |
+| `Args:` section      | Per-parameter descriptions |
+| Type annotations     | JSON Schema type         |
+| No default value     | Parameter is `required` |
+| Default value        | Parameter has `default`; not required |
 
-**Annotations.** `str` → string, `int` → integer, `float` → number, `bool` → boolean,
-`list[X]`/`tuple[X, ...]` → array of X, `dict[str, X]` → object, `Optional[X]` and `X | None`
-→ `anyOf`, `Literal[...]` → `enum`. An annotation `jerry` cannot map, or none at all, leaves
-the parameter with a description and no type. String annotations (`from __future__ import
-annotations`) are resolved when they can be.
+`*args` and `**kwargs` are not sent to the model.
+
+### Supported Annotations
+
+| Python type             | JSON Schema type      |
+| ----------------------- | --------------------- |
+| `str`                   | `string`              |
+| `int`                   | `integer`             |
+| `float`                 | `number`              |
+| `bool`                  | `boolean`             |
+| `list[X]` / `tuple[X, ...]` | `array` of X      |
+| `dict[str, X]`          | `object`              |
+| `Optional[X]` / `X \| None` | `anyOf` (X, null) |
+| `Literal[...]`          | `enum`                |
+
+If `jerry` cannot map an annotation (or none is given), the parameter receives a description but no type. String annotations (`from __future__ import annotations`) are resolved when possible.
 
 ```sh
-jerry -T tools/weather.py -T tools/cities.py        # modules can be repeated
+jerry -T tools/weather.py -T tools/cities.py   # multiple modules are supported
 ```
 
-Two modules that define the same tool name is a usage error (exit code 1), as is a
-module with no `tool_` function, a module that cannot be read, or one that raises while
-it is loaded.
+## Error Handling
 
----
+The following situations cause `jerry` to exit with code 1:
+
+- Two modules define a tool with the same name.
+- A module contains no `tool_` functions.
+- A module cannot be read or raises an exception during import.
 
 ## Options
 
-| Flag | Meaning |
-| --- | --- |
-| `-T`, `--tool` MODULE.py | take tools from this module, repeatable |
-| `-L`, `--log` FILE | append timestamped tool calls to FILE (`JERRY_TOOL_LOG`) |
-| `--max-turns` N | how many times the model may ask for tools in one run (default 8, `JERRY_MAX_TURNS`) |
+| Flag                    | Meaning                                         |
+| ----------------------- | ------------------------------------------------ |
+| `-T`, `--tool` MODULE  | Load tools from this module (repeatable)           |
+| `-L`, `--log` FILE     | Append timestamped tool calls to FILE (`JERRY_TOOL_LOG`) |
+| `--max-turns` N        | Max tool-request turns per run (default 8, `JERRY_MAX_TURNS`) |
 
-A *turn* is one request to the server plus whatever tools it asks for. When the model keeps
-asking after `--max-turns` turns, `jerry` reports it and stops with exit code 4.
+A *turn* is one request to the model plus any tools it calls. If the model exceeds `--max-turns`, `jerry` stops with exit code 4.
 
----
+## Execution
 
-## What a tool gets, and what comes back
+The model sends a tool call as a name and JSON arguments. `jerry` calls the corresponding function with those arguments as keyword parameters. The return value is fed back to the model in the same session:
 
-The model sends a call as a name and JSON arguments. `jerry` calls the function with the
-arguments as keywords, and what it returns is fed back to the model in the same session:
+- **`str`** — returned as-is.
+- **Anything else** — serialized to JSON.
+- **`None`** (no return) — returned as the string `"no result"`.
 
-- a string goes back as it is,
-- anything else goes back as JSON,
-- a tool that returns nothing (one that only prints, say) goes back as `no result`.
-
-Nothing is fatal. A tool that raises, an argument list that is not valid JSON, a name the
-module does not have — each is reported to the model as the answer to its own call, so it
-can react on it, and the run carries on. The exit code is still 0:
+Errors are never fatal. If a tool raises, the arguments are invalid JSON, or the model calls a non-existent tool, `jerry` reports the error as the tool's response so the model can react. The run continues with exit code 0:
 
 ```
 tool broken failed: ValueError: the weather service is down
@@ -86,11 +91,9 @@ no tool named translate
 the arguments are not valid json: {city":
 ```
 
----
+## Output
 
-## What is printed
-
-`jerry`' own lines about a tool call belong on stderr, and only with `-v`:
+`jerry`'s own lines about tool calls go to **stderr** and appear only with `-v`:
 
 ```
 jerry: tools   get_weather, list_cities
@@ -98,34 +101,28 @@ jerry: tool  get_weather({"city": "Paris"})
 jerry: tool  get_weather -> Sunny, 21C (0.03s)
 ```
 
-A tool function may print on stdout or stderr itself, and that is fine, but it goes through
-the same ordered writer as everything else, so nothing comes out of order: the call line,
-whatever the tool printed while it ran, the result line. `stdout` is still the response, so
-on a terminal where the meter owns stderr the tool's output is written once the run is over,
-in the order it happened. A tool that prints on stdout prints into `-o FILE` as well when one
-was given, and `-q` only silences jerry, never a tool.
+A tool function may print to `stdout` or `stderr` freely. `jerry` ensures that output appears in the correct order (call line → tool output → result line) via its ordered writer. `stdout` remains the response stream, so on a terminal where a meter owns stderr, the tool's output is flushed only after the run completes. When `-o FILE` is given, tool `stdout` is written to that file as well. The `-q` flag silences `jerry` but never a tool.
 
----
+## Tool Log
 
-## Tool log
-
-`-L FILE` writes one line per call to FILE, appended, whatever `-v` is doing. It is there to
-be read afterwards, so the fields are fixed:
+`-L FILE` appends one line per call to *FILE*, regardless of `-v`. This file is intended for post-run analysis, so the format is fixed:
 
 ```
 2026-10-21T18:24:52+02:00 turn 1 get_weather {"city": "Paris"} -> mock weather in Paris (c) (0.00s)
 2026-10-21T18:24:53+02:00 turn 2 broken {"city": "fail"} -> tool broken failed: ValueError: the weather service is down (0.00s)
 ```
 
-timestamp (local, with the offset), turn, tool name, arguments as one sorted JSON object,
-then the result or the failure, then how long the call took. The arguments are written sorted
-so the same call reads the same way every time.
+Each line contains:
 
----
+1. Timestamp (local, with offset)
+2. Turn number
+3. Tool name
+4. Arguments as a single sorted JSON object
+5. Result or failure message
+6. Duration in seconds
+
+Arguments are sorted so that identical calls produce identical log lines.
 
 ## Determinism
 
-The tools are sent in name order, so the same modules send the same request whatever order
-`-T` was given them in. `jerry` runs a tool when the model asks for one, so a run that calls
-a tool is only as reproducible as the tool itself; a tool that reads a file, the clock, or the
-network is not reproducible on its own.
+Tools are sent to the model in name order, so the same set of modules produces the same request regardless of the order `-T` flags are given. `jerry` executes a tool only when the model asks for it, so a run that involves tools is only as reproducible as the tools themselves — any tool that reads a file, the clock, or the network is inherently non-deterministic.
