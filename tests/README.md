@@ -27,6 +27,12 @@ counts towards `max_tokens`, and an answer that does not fit ends with
 `finish_reason: length`. `usage` and `timings` are sent so the `-v` summary can be
 checked. It can also be run by hand: `MOCK_PORT=8081 python3 tests/mock_server.py`.
 
+For tool runs: `call the tool [name]` is a call for that tool, `call the tool again` is a
+call every turn (the turn limit test), a turn that already carries a tool result answers
+with `tool said: <what jerry fed back>`, and a prompt that asks for the messages gets back
+the roles it was sent. The arguments of a call are built from the tool's own declaration,
+so a tool is never handed keywords it does not take.
+
 Message content is taken as either a string or a multimodal content array. An array is
 flattened to text with one `<image>` marker per image entry, which is what lets a test
 see that the array arrived rather than the raw `<jerry:...>` tags, and `prompt_tokens`
@@ -34,8 +40,9 @@ charges a vision slot (`VISION_TOKENS`, a stand-in, not a real count) per image 
 image-only run still reports prompt tokens.
 
 Because the mock always produces reasoning and is deterministic, the tests that
-skip themselves against a real model (reasoning, seeded repeat) all run here, and the tool
-call test only runs against the mock (a real server never gets tools from `jerry`).
+skip themselves against a real model (reasoning, seeded repeat) all run here. The tool
+tests need the mock as well: a real model does not have to call a tool, so they skip
+themselves with `--server`.
 
 ## What is checked
 
@@ -51,7 +58,8 @@ call test only runs against the mock (a real server never gets tools from `jerry
 * `--no-stream`, `-m`, `-u`, `-t`, `--limit`, `-q`, `--version`, `--help` flags
 * request payload: seed on every request, default limit 32768, no temperature /
   top_k / vendor settings, one message only, `/v1/chat/completions` + `/v1/models`
-  only, standard library only, no client side cache
+  only, standard library only, no client side cache, tools only sent when a module
+  was given and only in name order
 * broken pipe, SIGINT, command substitution / pipes, determinism (skipped when the
   server does not honour the seed, as the README says it may not)
 
@@ -69,9 +77,28 @@ the payloads so the same files send the same request run to run even though `tom
 IDs each time. `-e` echoes the input as it received it, tags intact, so feeding it back rebuilds
 the same content with the previous answer now part of the text.
 
+Tools (`toolmod.py` is the fixture module, so the metadata is read off a real declaration):
+the tool_ functions are the tools and nothing else is, the name is the function name without
+the prefix, the description is the first block of the docstring, the `Args:` block gives each
+parameter its description, annotations become JSON Schema types (array item type kept), a
+default is reported and makes the parameter optional, `*args` is not a parameter, a name that
+only reexports a tool counts, and a module with no tool, that cannot be read, that raises
+while loading, or that defines the same tool as another module is a usage error. What a tool
+returns: text as it is, anything else as JSON, nothing as `no result`; a failure, bad
+arguments and a name the module does not have are fed back to the model instead of ending the
+run. The one ordered writer: the call line, whatever the tool printed while it ran, the result
+line, in that order, on a pipe and on a terminal; a tool sees the writer for the call and the
+real channels afterwards. The tool log is the line documented in TOOLS.md (timestamp, turn,
+tool, sorted arguments, result, time), it is appended rather than rewritten, and it is written
+whatever `-v` or `-q` is doing. Against a server: a call is run and its answer fed back,
+nothing is printed about a call without `-v`, the tool phase shows on the meter, an interrupt
+while a tool runs exits 130, the turn limit stops a model that keeps calling, and the session
+is the first message plus the model's call and the tool's answer, and the output limit counts a turn
+rather than the whole run.
+
 ## Observed result
 
-104 tests against the mock, all pass, none skipped (about 25 seconds).
+156 tests against the mock, all pass, none skipped (about 30 seconds).
 
 `jerry` bugs, both fixed since:
 
@@ -82,6 +109,16 @@ One more, found while writing the multimodal tests:
 
 3. the tag regex had no `re.DOTALL`, so a `.txt`/`.md` payload containing a newline was
    never recognised as content and the raw tags were sent to the server
+
+Found while writing the tool tests:
+
+4. `Writer.close()` closed the log file and then flushed it (`ValueError: I/O operation on
+   closed file`)
+5. `merge` summed the usage numbers as if every value were a number, so a server that sends
+   a nested object in `usage` or `timings` raised TypeError
+6. `Literal[...]` was read as if its values were types, so an enum got no type
+7. `take` took the arguments of a tool call as they arrived in one piece, so a call streamed
+   in fragments lost everything after the first
 
 What still differs on a real server: the determinism test skips if the server ignores the
 seed (as the README documents for this one), and some tests skip when the model produces no

@@ -9,6 +9,9 @@ depend on the prompt:
     "List the numbers 1 to N"   N lines, one token each
     "story"                     a 200 token answer, so the run takes a couple of seconds
     "call the tool"             a tool call, finish_reason "tool_calls"
+    "call the tool again"       a tool call every turn, so the run keeps going
+    a turn that already carries a tool result  "tool said: <what jerry fed back>", or, when the
+                                        prompt asks for it, the roles of the messages it was sent
     anything else               "mock reply for: <prompt>"
 
 Message content is taken either as a plain string or as a multimodal content
@@ -63,25 +66,66 @@ def count_images(content):
     return sum(1 for part in content or [] if part.get("type") == "image_url")
 
 
-def plan(prompt, req):
+def tool_specs(req):
+    """The tool declarations the request carries, in the order they were sent."""
+    return [t.get("function", {}) for t in req.get("tools") or []]
+
+
+def tool_results(messages):
+    """What the client fed back, in order. This is what a tool run can be checked against."""
+    return [m.get("content") or "" for m in messages if m.get("role") == "tool"]
+
+
+def canned_arguments(low, spec):
+    """A tool call that matches what the tool declared, so the tool does not have to guess.
+
+    Every required parameter gets a value: the word the prompt put after its name,
+    or the stand-in for its type.
+    """
+    params = ((spec or {}).get("parameters") or {}).get("properties") or {}
+    required = ((spec or {}).get("parameters") or {}).get("required") or []
+    stand_in = {"string": "Paris", "integer": 3, "number": 1.5, "boolean": True, "array": ["Paris"]}
+    values = {}
+    for name in required:
+        mentioned = re.search(r"\b%s\s+(\w+)" % re.escape(name), low)
+        entry = params.get(name) or {}
+        values[name] = mentioned.group(1) if mentioned else stand_in.get(entry.get("type"), "Paris")
+        if entry.get("type") == "array" and not mentioned:
+            values[name] = [values[name]]
+    return values
+
+
+def plan(prompt, req, messages=()):
     """-> (reasoning tokens, content tokens, tool call or None)"""
     low = prompt.lower()
-    if "call the tool" in low:
-        return [], [], {"name": "get_weather", "arguments": '{"city": "Paris"}'}
+    results = tool_results(messages)
+    if "call the tool" in low and (not results or "again" in low):
+        declared = tool_specs(req)
+        wanted = re.search(r"call the tool (\w+)", low)
+        spec = next((s for s in declared if s.get("name") == (wanted and wanted.group(1))), None)
+        name = wanted.group(1) if wanted else (declared[0].get("name") if declared else "get_weather")
+        return [], [], {"name": name, "arguments": json.dumps(canned_arguments(low, spec))}
     reasoning = []
     if req.get("enable_thinking") is not False:
         reasoning = ["pondering the question, step %d. " % i for i in range(1, 13)]
     numbers = re.search(r"list the numbers 1 to (\d+)", low)
     if numbers:
         return reasoning, ["%d\n" % i for i in range(1, int(numbers.group(1)) + 1)], None
+    if results:
+        # once the tool has run, the answer is what it handed back, unless the prompt
+        # asked for the session to be listed
+        if "list the messages" in low:
+            return [], ["message %d: %s\n" % (i, m.get("role") or "?")
+                        for i, m in enumerate(messages)], None
+        return [], ["tool said: " + results[0]], None
     if "story" in low:
         return reasoning, [STORY[i % len(STORY)] + " " for i in range(200)], None
     return reasoning, re.findall(r"\S+\s*", "mock reply for: " + prompt[:100]), None
 
 
-def answer(prompt, req):
+def answer(prompt, req, messages=()):
     """-> ([(field, token), ...] within max_tokens, tool call, finish_reason)"""
-    reasoning, content, call = plan(prompt, req)
+    reasoning, content, call = plan(prompt, req, messages)
     seq = [("reasoning_content", t) for t in reasoning] + [("content", t) for t in content]
     finish = "tool_calls" if call else "stop"
     limit = req.get("max_tokens")
@@ -122,8 +166,10 @@ class Handler(BaseHTTPRequestHandler):
         messages = req.get("messages") or [{}]
         content = messages[0].get("content") or ""
         prompt = prompt_text(content)
-        seq, call, finish = answer(prompt, req)
-        usage, timings = stats(prompt, len(seq), count_images(content))
+        seq, call, finish = answer(prompt, req, messages)
+        # prompt_tokens counts the whole session, not just the first message
+        full = " ".join(p for p in (prompt_text(m.get("content")) for m in messages) if p)
+        usage, timings = stats(full, len(seq), count_images(content))
         if req.get("stream", True):
             self._stream(seq, call, finish, usage, timings)
         else:

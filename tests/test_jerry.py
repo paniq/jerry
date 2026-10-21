@@ -20,6 +20,7 @@ import argparse
 import base64
 import contextlib
 import fcntl
+import inspect
 import io
 import json
 import os
@@ -31,6 +32,7 @@ import signal
 import subprocess
 import sys
 import time
+import typing
 import unittest
 import urllib.request
 from importlib import machinery as importlib_machinery
@@ -41,6 +43,8 @@ ROOT = os.path.dirname(HERE)
 JERRY = os.path.join(ROOT, "jerry")
 TOM = os.path.join(ROOT, "tom")
 README = os.path.join(ROOT, "README.md")
+TOOLS_MD = os.path.join(ROOT, "TOOLS.md")
+TOOLMOD = os.path.join(HERE, "toolmod.py")
 
 sys.path.insert(0, HERE)
 import mock_server  # noqa: E402
@@ -50,15 +54,20 @@ import mock_server  # noqa: E402
 SERVER = os.environ.get("JERRY_TEST_URL") or None
 TIMEOUT = float(os.environ["JERRY_TEST_TIMEOUT"]) if os.environ.get("JERRY_TEST_TIMEOUT") else None
 
-EXIT_OK, EXIT_USAGE, EXIT_SERVER, EXIT_LIMIT, EXIT_KILLED = 0, 1, 2, 3, 130
+EXIT_OK, EXIT_USAGE, EXIT_SERVER, EXIT_LIMIT, EXIT_TOOL, EXIT_KILLED = 0, 1, 2, 3, 4, 130
+
+
+def doc_flags(path, heading):
+    """Flags documented in a table under the given heading of a doc file."""
+    with open(path) as fh:
+        text = fh.read()
+    section = text.split(heading, 1)[1].split("\n---", 1)[0]
+    return re.findall(r"^\| `(-{1,2}[A-Za-z-]+)", section, re.M)
 
 
 def readme_flags(heading):
     """Flags documented in a README table under the given heading."""
-    with open(README) as fh:
-        text = fh.read()
-    section = text.split(heading, 1)[1].split("\n---", 1)[0]
-    return re.findall(r"^\| `(-{1,2}[A-Za-z-]+)", section, re.M)
+    return doc_flags(README, heading)
 
 
 def reachable(url, timeout=10):
@@ -284,7 +293,7 @@ class TestReadmeSpec(unittest.TestCase):
 
     def test_exit_codes_documented_in_help(self):
         r = subprocess.run([JERRY, "--help"], capture_output=True, text=True)
-        for code in (0, 1, 2, 3, 130):
+        for code in (0, 1, 2, 3, 4, 130):
             self.assertIn(" %d " % code, r.stdout, "help should list exit code %d" % code)
 
     def test_help_lists_every_documented_flag(self):
@@ -293,6 +302,15 @@ class TestReadmeSpec(unittest.TestCase):
         r = subprocess.run([JERRY, "--help"], capture_output=True, text=True)
         for flag in flags:
             self.assertIn(flag, r.stdout, "%s is documented in the README but missing from --help" % flag)
+
+    def test_tool_flags_are_documented_in_tools_md_and_in_help(self):
+        """TOOLS.md holds the tool documentation, so its table has to match --help too."""
+        flags = doc_flags(TOOLS_MD, "## Options")
+        self.assertEqual(sorted(flags), ["--max-turns", "-L", "-T"], flags)
+        r = subprocess.run([JERRY, "--help"], capture_output=True, text=True)
+        for flag in flags:
+            self.assertIn(flag, r.stdout, "%s is documented in TOOLS.md but missing from --help" % flag)
+        self.assertIn("TOOLS.md", r.stdout, "--help should point at the tool documentation")
 
     def test_documented_defaults(self):
         r = subprocess.run([JERRY, "--help"], capture_output=True, text=True)
@@ -330,13 +348,17 @@ class TestReadmeSpec(unittest.TestCase):
                          "jerry should only use the documented endpoints")
 
     def test_flush_clears_pending_so_a_held_response_is_printed_once(self):
-        out = JERRY_MOD.Out(JERRY_MOD.parse_args([]), hold=True)
+        args = JERRY_MOD.parse_args([])
+        meter = JERRY_MOD.Meter(args, 100)
+        meter.tty = meter.clean = True          # the meter owns stderr, so output is held
         buf = io.StringIO()
-        out.fh = buf
-        out.write("answer")
-        out.flush()
+        writer = JERRY_MOD.Writer(args, meter, io.StringIO())
+        writer.out_fh, writer.err_fh = buf, buf
+        writer.write("out", "answer")
+        self.assertEqual(buf.getvalue(), "", "held until the run is over")
+        writer.flush()
         self.assertEqual(buf.getvalue(), "answer")
-        out.flush()
+        writer.flush()
         self.assertEqual(buf.getvalue(), "answer", "pending was not cleared: the response is printed twice")
 
     def test_meter_stays_silent_without_verbose(self):
@@ -376,6 +398,13 @@ class TestReadmeSpec(unittest.TestCase):
             code = JERRY_MOD.finish_code(JERRY_MOD.parse_args([]), "tool_calls", 32768)
         self.assertEqual(code, EXIT_SERVER)
         self.assertIn("the model requested a tool call, jerry has no tools to run", buf.getvalue())
+
+    def test_a_tool_call_is_not_an_error_when_there_are_tools_to_run(self):
+        registry = JERRY_MOD.build_registry(JERRY_MOD.parse_args(["-T", TOOLMOD]))
+        with captured_stderr() as buf:
+            code = JERRY_MOD.finish_code(JERRY_MOD.parse_args([]), "tool_calls", 32768, registry)
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(buf.getvalue(), "", "the call is run, not reported")
 
     def test_exit_code_constants(self):
         self.assertEqual((JERRY_MOD.EXIT_OK, JERRY_MOD.EXIT_USAGE, JERRY_MOD.EXIT_SERVER,
@@ -734,6 +763,279 @@ class TestMultimodalContent(unittest.TestCase):
                          "the same files must send the same content")
 
 
+# --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# tools: what a tool module becomes
+# --------------------------------------------------------------------------- #
+
+@contextlib.contextmanager
+def quiet_run(log=None, verbose=True):
+    """A run with nothing but a writer, so jerry's parts can be called directly."""
+    args = JERRY_MOD.parse_args(["-v"] if verbose else [])
+    meter = JERRY_MOD.Meter(args, 100)
+    meter.tty = meter.clean = False
+    writer = JERRY_MOD.Writer(args, meter, log)
+    out, err = io.StringIO(), io.StringIO()
+    writer.out_fh, writer.err_fh = out, err
+    meter.stream = err                            # the meter writes to stderr as well
+    saved = JERRY_MOD.ACTIVE
+    JERRY_MOD.ACTIVE = writer
+    try:
+        yield args, writer, meter, out, err
+    finally:
+        JERRY_MOD.ACTIVE = saved
+
+
+def registry_of(*paths):
+    argv = []
+    for path in paths:
+        argv += ["-T", path]
+    return JERRY_MOD.build_registry(JERRY_MOD.parse_args(argv))
+
+
+def spec_of(name):
+    """The metadata jerry derives for one tool in the fixture module."""
+    return registry_of(TOOLMOD)[name][1]
+
+
+def tool(name, arguments):
+    """Run one tool through jerry, and return what the model was told."""
+    with quiet_run(io.StringIO()) as (args, writer, meter, out, err):
+        return JERRY_MOD.call_tool(args, writer, meter, registry_of(TOOLMOD), name, arguments, 1)
+
+
+def temp_module(name, text):
+    path = os.path.join(HERE, name)
+    with open(path, "w") as fh:
+        fh.write(text)
+    return path
+
+
+class TestToolMetadata(unittest.TestCase):
+
+    def test_every_function_beginning_with_tool_is_a_tool(self):
+        module = JERRY_MOD.load_tool_module(TOOLMOD)
+        self.assertEqual(sorted(registry_of(TOOLMOD)),
+                         ["anything", "broken", "get_weather", "list_cities", "note", "prints", "silent",
+                          "slow", "untyped"])
+        self.assertIn("helper", vars(module), "a tool module may have helpers of its own")
+        self.assertNotIn("helper", registry_of(TOOLMOD), "a name that does not begin with tool_ is not a tool")
+        self.assertTrue(callable(vars(module)["helper"]))
+
+    def test_the_tool_name_is_the_function_name_without_the_prefix(self):
+        self.assertEqual(spec_of("get_weather")["name"], "get_weather")
+        self.assertEqual(registry_of(TOOLMOD)["get_weather"][0].__name__, "tool_get_weather",
+                         "the prefix is what marks a function as a tool")
+
+    def test_the_declaration_becomes_the_json_rpc_metadata(self):
+        """The example in the spec: everything is read off the function itself."""
+        spec = spec_of("get_weather")
+        self.assertEqual(spec["description"], "Current weather for a city.")
+        self.assertEqual(spec["parameters"]["type"], "object")
+        self.assertEqual(sorted(spec["parameters"]["properties"]), ["city", "units"])
+        self.assertEqual(spec["parameters"]["properties"]["city"],
+                         {"type": "string", "description": "city name"})
+        self.assertEqual(spec["parameters"]["required"], ["city"], "units has a default")
+        self.assertEqual(spec["parameters"]["properties"]["units"]["default"], "c")
+
+    def test_no_description_and_no_parameters_is_still_a_tool(self):
+        spec = spec_of("list_cities")
+        self.assertEqual(spec["description"], "Cities known to the server.")
+        self.assertEqual(spec["parameters"]["properties"], {})
+        self.assertEqual(spec["parameters"]["required"], [])
+        self.assertEqual(json.loads(tool("list_cities", "{}")), ["Paris", "Oslo"])
+
+    def test_a_tool_that_returns_nothing_answers_no_result(self):
+        self.assertEqual(tool("silent", "{}"), "no result")
+
+    def test_annotations_become_json_schema_types(self):
+        want = {"broken": {"city": {"type": "string", "description": "city name"}},
+                "note": {"name": {"type": "string", "description": "the name"},
+                         "note": {"type": "string",
+                                  "description": "left out when there is nothing to add",
+                                  "default": None}},
+                "untyped": {"value": {"description": "what to say"}},
+                "anything": {"name": {"type": "string",
+                                      "description": "the only parameter that is a parameter"}}}
+        for name, properties in want.items():
+            self.assertEqual(spec_of(name)["parameters"]["properties"], properties, name)
+
+    def test_the_shape_of_an_annotation_is_kept(self):
+        self.assertEqual(JERRY_MOD.json_type(list[str]), {"type": "array", "items": {"type": "string"}})
+        self.assertEqual(JERRY_MOD.json_type(dict[str, int]),
+                         {"type": "object", "additionalProperties": {"type": "integer"}})
+        self.assertEqual(JERRY_MOD.json_type(int), {"type": "integer"})
+        self.assertEqual(JERRY_MOD.json_type(bool), {"type": "boolean"})
+        self.assertEqual(JERRY_MOD.json_type(str | None), {"anyOf": [{"type": "string"}, {"type": "null"}]})
+        self.assertEqual(sorted(JERRY_MOD.json_type(typing.Literal["c", "f"]).items()),
+                         [("enum", ["c", "f"]), ("type", "string")])
+        self.assertEqual(JERRY_MOD.json_type(inspect.Parameter.empty), {})
+
+    def test_star_args_are_not_parameters(self):
+        spec = spec_of("anything")
+        self.assertEqual(sorted(spec["parameters"]["properties"]), ["name"])
+        self.assertEqual(spec["parameters"]["required"], ["name"])
+
+    def test_an_optional_parameter_is_not_required_but_is_reported(self):
+        spec = spec_of("note")
+        self.assertEqual(spec["parameters"]["required"], ["name"], "note has a default")
+        self.assertIn("note", spec["parameters"]["properties"])
+
+    def test_a_tool_can_be_a_function_the_module_only_reexports(self):
+        path = temp_module(".tmp_reexport.py", "def helper(x):\n    return x\n\ntool_alias = helper\n")
+        try:
+            self.assertEqual(sorted(registry_of(path)), ["alias"],
+                              "every name that begins with tool_ is a tool, however it got there")
+        finally:
+            os.unlink(path)
+
+    def test_a_module_with_no_tool_functions_is_a_usage_error(self):
+        path = temp_module(".tmp_notools.py", "def nothing():\n    return 1\n")
+        try:
+            with self.assertRaises(JERRY_MOD.UsageError):
+                registry_of(path)
+        finally:
+            os.unlink(path)
+
+    def test_two_modules_that_define_the_same_tool_are_a_usage_error(self):
+        path = temp_module(".tmp_same.py", "def tool_get_weather(x: str) -> str:\n    return x\n")
+        try:
+            with self.assertRaises(JERRY_MOD.UsageError) as caught:
+                registry_of(TOOLMOD, path)
+            self.assertIn("both define tool get_weather", str(caught.exception))
+        finally:
+            os.unlink(path)
+
+    def test_an_unreadable_tool_module_is_a_usage_error(self):
+        with self.assertRaises(JERRY_MOD.UsageError):
+            registry_of("tests/definitely-not-here.py")
+
+    def test_a_module_that_raises_while_it_is_being_loaded_is_a_usage_error(self):
+        path = temp_module(".tmp_broken_import.py", "raise RuntimeError('the module itself fails')\n")
+        try:
+            with self.assertRaises(JERRY_MOD.UsageError):
+                registry_of(path)
+        finally:
+            os.unlink(path)
+
+    def test_the_tools_are_sent_in_name_order(self):
+        registry = registry_of(TOOLMOD)
+        payload, _ = JERRY_MOD.build_payload(JERRY_MOD.parse_args([]), [], 0, registry)
+        self.assertEqual([t["function"]["name"] for t in payload["tools"]], sorted(registry))
+        self.assertEqual(payload["tools"][0]["type"], "function")
+
+    def test_no_tools_are_sent_when_nothing_was_given(self):
+        payload, _ = JERRY_MOD.build_payload(JERRY_MOD.parse_args([]), [], 0)
+        self.assertNotIn("tools", payload)
+
+    def test_the_tools_are_the_only_thing_added_for_a_tool_module(self):
+        payload, _ = JERRY_MOD.build_payload(JERRY_MOD.parse_args([]), [], 0, registry_of(TOOLMOD))
+        self.assertEqual(sorted(payload), ["max_tokens", "messages", "seed", "stream", "tools"])
+
+    def test_a_call_that_arrives_in_pieces_is_built_up(self):
+        args = JERRY_MOD.parse_args([])
+        meter = JERRY_MOD.Meter(args, 100)
+        meter.tty = meter.clean = False
+        writer = JERRY_MOD.Writer(args, meter, None)
+        writer.out_fh, writer.err_fh = io.StringIO(), io.StringIO()
+
+        data = JERRY_MOD.new_data()
+        for piece in ('{"city": ', '"Paris"}'):
+            JERRY_MOD.take(args, {"tool_calls": [{"index": 0, "id": "call_1",
+                                                  "function": {"name": "get_weather",
+                                                             "arguments": piece}}]}, data, meter, writer)
+        self.assertEqual(data["tool_calls"][0]["arguments"], '{"city": "Paris"}')
+        self.assertEqual(data["tool_calls"][0]["name"], "get_weather")
+
+        # an argument sent as an object instead of a string reads the same way
+        other = JERRY_MOD.new_data()
+        JERRY_MOD.take(args, {"tool_calls": [{"function": {"name": "get_weather",
+                                                          "arguments": {"city": "Paris"}}}]}, other, meter, writer)
+        self.assertEqual(other["tool_calls"][0]["arguments"], '{"city": "Paris"}')
+
+    def test_the_result_of_a_tool_is_json_when_it_is_not_text(self):
+        self.assertEqual(JERRY_MOD.tool_text("a string"), "a string")
+        self.assertEqual(JERRY_MOD.tool_text(["Paris", "Oslo"]), '["Paris", "Oslo"]')
+        self.assertEqual(JERRY_MOD.tool_text({"city": "Paris"}), '{"city": "Paris"}')
+        self.assertEqual(JERRY_MOD.tool_text(None), "no result", "a tool that only printed")
+
+    def test_a_failure_is_fed_back_to_the_model_as_the_answer_to_its_call(self):
+        self.assertEqual(tool("broken", '{"city": "Paris"}'),
+                         "tool broken failed: ValueError: the weather service is down")
+
+    def test_arguments_that_are_not_json_are_fed_back_as_well(self):
+        self.assertIn("not valid json", tool("get_weather", '{city":'))
+        self.assertIn("not an object", tool("get_weather", "[1, 2]"))
+
+    def test_a_tool_name_the_module_does_not_have_is_fed_back_as_well(self):
+        self.assertEqual(tool("translate", "{}"), "no tool named translate")
+
+    def test_a_tool_prints_in_the_order_it_spoke(self):
+        """The call line, whatever the tool printed while it ran, then the result line."""
+        with quiet_run(io.StringIO()) as (args, writer, meter, out, err):
+            writer.hold = True                  # record the events instead of writing them
+            JERRY_MOD.call_tool(args, writer, meter, registry_of(TOOLMOD), "prints", '{"note": "hi"}', 1)
+            events = [(channel, text) for channel, text in writer.pending if text.strip()]
+            self.assertEqual([channel for channel, _ in events], ["err", "out", "err", "err", "log"])
+            self.assertIn("jerry: tool  prints", events[0][1])
+            self.assertIn("tool says hello on stdout", events[1][1])
+            self.assertIn("tool says hello on stderr", events[2][1])
+            self.assertIn("printed hi", events[3][1])
+            self.assertIn("turn 1 prints", events[4][1])
+
+    def test_a_tool_sees_the_writer_while_it_runs_and_the_channels_after(self):
+        seen = []
+
+        def peek(name: str) -> str:
+            seen.append(sys.stdout)
+            return "ok"
+
+        saved = sys.stdout
+        with quiet_run(io.StringIO()) as (args, writer, meter, out, err):
+            registry = {"peek": (peek, JERRY_MOD.tool_spec(peek), "test")}
+            JERRY_MOD.call_tool(args, writer, meter, registry, "peek", '{"name": "x"}', 1)
+        self.assertIsInstance(seen[0], JERRY_MOD.Proxy)
+        self.assertIs(seen[0].writer, writer)
+        self.assertIs(sys.stdout, saved, "the channel is put back after the call")
+
+    def test_the_tool_log_line_is_the_one_in_tools_md(self):
+        """timestamp, turn, tool, arguments, result, how long it took."""
+        with quiet_run(io.StringIO()) as (args, writer, meter, out, err):
+            JERRY_MOD.report_call(args, writer, 1, "get_weather", '{"b": 2, "a": 1}', "Sunny, 21C", time.monotonic())
+            self.assertRegex(writer.log_fh.getvalue().strip(),
+                             r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2} turn 1 get_weather "
+                             r"\{\"a\": 1, \"b\": 2\} -> Sunny, 21C \(\d+\.\d{2}s\)$")
+
+    def test_the_arguments_in_the_log_are_written_sorted(self):
+        with quiet_run(io.StringIO()) as (args, writer, meter, out, err):
+            JERRY_MOD.report_call(args, writer, 1, "get_weather", '{"b": 2, "a": 1}', "Sunny", time.monotonic())
+            self.assertIn('{"a": 1, "b": 2}', writer.log_fh.getvalue())
+
+    def test_the_log_is_written_whatever_v_is_doing(self):
+        """No -v, and -q on top of it: nothing on stderr, the log still gets its line."""
+        log = io.StringIO()
+        with quiet_run(log, verbose=False) as (args, writer, meter, out, err):
+            args.quiet = True
+            JERRY_MOD.call_tool(args, writer, meter, registry_of(TOOLMOD), "get_weather", '{"city": "Paris"}', 1)
+            self.assertEqual(err.getvalue(), "")
+            self.assertIn("turn 1 get_weather", log.getvalue())
+
+    def test_nothing_is_logged_when_no_log_was_asked_for(self):
+        args = JERRY_MOD.parse_args([])
+        self.assertIsNone(args.log)
+        with quiet_run(None, verbose=False) as (args, writer, meter, out, err):
+            JERRY_MOD.call_tool(args, writer, meter, registry_of(TOOLMOD), "get_weather", "{}", 1)
+            self.assertIsNone(writer.log_fh)
+            self.assertEqual(err.getvalue(), "")
+
+    def test_jerry_tool_log_is_the_default_for_the_log(self):
+        self.assertEqual(load_jerry({"JERRY_TOOL_LOG": "/tmp/toolcall.log"}).parse_args([]).log, "/tmp/toolcall.log")
+
+    def test_the_documented_default_number_of_turns(self):
+        self.assertEqual(JERRY_MOD.parse_args([]).max_turns, 8)
+        self.assertEqual(load_jerry({"JERRY_MAX_TURNS": "3"}).parse_args([]).max_turns, 3)
+
+# --------------------------------------------------------------------------- #
 # --------------------------------------------------------------------------- #
 # live tests (against the mock server, or a real one with --server)
 # --------------------------------------------------------------------------- #
@@ -1128,6 +1430,238 @@ class TestMultimodalLive(LiveCase):
             self.assertGreater(int(reported.group(1)), mock_server.VISION_TOKENS,
                                "the mock did not count the image in the prompt")
 
+
+# --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# tools, against a server
+# --------------------------------------------------------------------------- #
+
+class TestToolCallingLive(LiveCase):
+
+    @staticmethod
+    def tool_run(args, prompt, **kwargs):
+        return Run(list(args) + ["-T", TOOLMOD, prompt], stdin=prompt, **kwargs)
+
+    def test_a_tool_call_is_run_and_the_result_is_fed_back(self):
+        prompt = "call the tool get_weather"
+        r = self.tool_run([], prompt).assert_ok()
+        if SERVER != MOCK_URL:
+            self.skipTest("the proof is the mock echoing the tool result back")
+        self.assertEqual(r.err, b"", "stderr is nothing by default")
+        self.assertEqual(r.out.decode().strip(), "tool said: mock weather in Paris (c)",
+                         "the answer the model gave after the tool ran")
+
+    def test_a_tool_the_model_does_not_call_changes_nothing(self):
+        r = self.tool_run([], PROMPT).assert_ok()
+        if SERVER != MOCK_URL:
+            self.skipTest("the expected answer is the mock's canned one")
+        self.assertEqual(r.out.decode().strip(), "mock reply for: " + PROMPT)
+        self.assertEqual(r.err, b"")
+
+    def test_tool_interaction_is_only_printed_with_v(self):
+        prompt = "call the tool get_weather"
+        quiet = self.tool_run([], prompt).assert_ok()
+        loud = self.tool_run(["-v"], prompt).assert_ok()
+        if SERVER != MOCK_URL:
+            self.skipTest("the run needs the mock, which only answers with a tool call")
+        self.assertNotIn("jerry: tool", quiet.err.decode(), "nothing about a call without -v")
+        self.assertIn("jerry: tool  get_weather({\"city\": \"Paris\"})", loud.err.decode())
+        self.assertIn("jerry: tool  get_weather -> mock weather in Paris (c)", loud.err.decode())
+        self.assertNotIn("jerry: tool", loud.out.decode(), "the call is not the response")
+
+    def test_the_tools_line_lists_the_tools(self):
+        text = self.tool_run(["-v"], PROMPT).assert_ok().err.decode()
+        lines = [l for l in text.splitlines() if l]
+        self.assertEqual(lines[0], "jerry: server  %s" % SERVER)
+        self.assertIn("jerry: tools   anything, broken, get_weather, list_cities, note, prints, silent, "
+                      "slow, untyped", lines)
+
+    def test_a_tool_failure_is_fed_back_to_the_model_and_the_run_carries_on(self):
+        prompt = "call the tool broken city fail"
+        r = self.tool_run([], prompt).assert_ok()
+        if SERVER != MOCK_URL:
+            self.skipTest("the proof is the mock echoing the tool result back")
+        self.assertIn("the weather service is down", r.out.decode())
+        self.assertEqual(r.err, b"", "a tool that fails is not jerry's problem")
+
+    def test_a_tool_name_the_module_does_not_have_is_fed_back_as_well(self):
+        prompt = "call the tool translate"
+        r = self.tool_run([], prompt).assert_ok()
+        if SERVER != MOCK_URL:
+            self.skipTest("the proof is the mock echoing the tool result back")
+        self.assertEqual(r.out.decode().strip(), "tool said: no tool named translate")
+
+    def test_the_meter_shows_the_tool_phase(self):
+        prompt = "call the tool get_weather"
+        text = self.tool_run(["-v"], prompt).assert_ok().err.decode()
+        self.assertRegex(text, r"jerry: \d+/\d+ +\d+\.\d+% +\d+\.\d+ t/s +\d+\.\d+s tool")
+
+    def test_tool_output_keeps_its_order(self):
+        """The call line, whatever the tool printed while it ran, then the result line."""
+        prompt = "call the tool prints note hello"
+        r = self.tool_run(["-v"], prompt).assert_ok()
+        call = r.first("err", r"jerry: tool  prints")
+        printed = r.first("out", r"tool says hello on stdout")
+        echoed = r.first("err", r"tool says hello on stderr")
+        result = r.first("err", r"jerry: tool  prints -> printed hello")
+        for stamp, name in ((call, "the call line"), (printed, "the tool's stdout line"),
+                            (echoed, "the tool's stderr line"), (result, "the result line")):
+            self.assertIsNotNone(stamp, "%s never arrived" % name)
+        self.assertLess(call, printed, "the tool printed before jerry had said what it called")
+        self.assertLess(printed, echoed, "the tool's own lines came out of order")
+        self.assertLess(echoed, result, "the result line came before the tool finished")
+
+    def test_on_a_terminal_the_meter_still_owns_stderr_and_the_order_keeps(self):
+        """Nothing is mixed into the meter's line: what it recorded is written after the run,
+        in the order it happened."""
+        prompt = "call the tool prints note hello"
+        r = self.tool_run(["-v"], prompt, tty_stderr=True).assert_ok()
+        text = r.err.decode("utf-8", "replace")
+
+        def pos(pattern):
+            match = re.search(pattern, text)
+            self.assertIsNotNone(match, "%s never arrived" % pattern)
+            return match.start()
+
+        meter = pos(r"jerry: \d+/\d+ .* tool")          # the meter's own line, live
+        call, printed, result = (pos(r"jerry: tool  prints"), pos(r"tool says hello on stderr"),
+                                 pos(r"jerry: tool  prints -> printed hello"))
+        self.assertLess(meter, call, "the meter keeps its line while a tool runs")
+        self.assertLess(call, printed, "the tool's own line came before the tool spoke")
+        self.assertLess(printed, result, "the tool's own line came after its result")
+        stdout = r.first("out", r"tool says hello on stdout")
+        self.assertIsNotNone(stdout, "the tool's stdout line never arrived")
+        self.assertGreater(stdout, r.first("err", r"jerry: \d+/\d+ .* tool"),
+                           "written once the run is over, in the order it happened")
+
+    def test_the_tool_log_is_written_in_the_documented_format(self):
+        path = os.path.join(HERE, ".tmp_toollog.txt")
+        prompt = "call the tool get_weather"
+        self.tool_run(["-L", path], prompt).assert_ok()
+        with open(path) as fh:
+            line = fh.read().strip()
+        self.assertRegex(line,
+                         r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2} turn 1 get_weather "
+                         r"\{\"city\": \"Paris\"\} -> mock weather in Paris \(c\) \(\d+\.\d{2}s\)$")
+        os.unlink(path)
+
+    def test_the_tool_log_is_appended_and_not_rewritten(self):
+        path = os.path.join(HERE, ".tmp_toollog.txt")
+        prompt = "call the tool get_weather"
+        with open(path, "w") as fh:
+            fh.write("an earlier line\n")
+        try:
+            for _ in range(2):
+                self.tool_run(["-L", path], prompt).assert_ok()
+        finally:
+            with open(path) as fh:
+                lines = fh.read().splitlines()
+            os.unlink(path)
+        self.assertEqual(lines[0], "an earlier line", "an existing log is appended to, not replaced")
+        self.assertEqual(len(lines), 3, "one line per call")
+        self.assertIn("turn 1 get_weather", lines[1])
+
+    def test_the_tool_log_records_a_failure_as_well(self):
+        path = os.path.join(HERE, ".tmp_toollog.txt")
+        prompt = "call the tool broken city fail"
+        self.tool_run(["-L", path], prompt).assert_ok()
+        with open(path) as fh:
+            line = fh.read()
+        os.unlink(path)
+        self.assertIn("turn 1 broken {\"city\": \"fail\"} -> tool broken failed", line)
+
+    def test_an_unwritable_tool_log_is_a_usage_error(self):
+        prompt = "call the tool get_weather"
+        r = Run(["-L", "/definitely-not-a-directory/tool.log", "-T", TOOLMOD, prompt], stdin=prompt)
+        self.assertEqual(r.code, EXIT_USAGE)
+        self.assertIn("cannot write the tool log", r.err.decode())
+
+    def test_the_turn_limit_stops_a_model_that_keeps_calling_tools(self):
+        prompt = "call the tool again and again"
+        r = Run(["--max-turns", "2", "-T", TOOLMOD, prompt], stdin=prompt)
+        if SERVER != MOCK_URL:
+            self.skipTest("only the mock calls a tool every turn")
+        self.assertEqual(r.code, EXIT_TOOL)
+        self.assertIn("kept asking for tools after 2 turns", r.err.decode())
+
+    def test_the_documented_turn_limit_is_the_default(self):
+        prompt = "call the tool again and again"
+        r = Run(["-T", TOOLMOD, prompt], stdin=prompt)
+        if SERVER != MOCK_URL:
+            self.skipTest("only the mock calls a tool every turn")
+        self.assertEqual(r.code, EXIT_TOOL)
+        self.assertIn("after 8 turns", r.err.decode())
+
+    def test_two_modules_that_define_the_same_tool_exit_one(self):
+        path = os.path.join(HERE, ".tmp_same_tool.py")
+        with open(path, "w") as fh:
+            fh.write("def tool_get_weather(x: str) -> str:\n    return x\n")
+        try:
+            r = Run(["-T", TOOLMOD, "-T", path, PROMPT], stdin=PROMPT)
+            self.assertEqual(r.code, EXIT_USAGE)
+            self.assertIn("both define tool get_weather", r.err.decode())
+        finally:
+            os.unlink(path)
+
+    def test_a_tool_module_with_no_tools_exits_one(self):
+        path = os.path.join(HERE, ".tmp_no_tools.py")
+        with open(path, "w") as fh:
+            fh.write("def nothing():\n    return 1\n")
+        try:
+            r = Run(["-T", path, PROMPT], stdin=PROMPT)
+            self.assertEqual(r.code, EXIT_USAGE)
+            self.assertIn("exports no tool_", r.err.decode())
+        finally:
+            os.unlink(path)
+
+    def test_interrupting_while_a_tool_runs_exits_130(self):
+        prompt = "call the tool slow note stop"
+        proc = subprocess.Popen([JERRY, "-v", "-T", TOOLMOD, prompt], stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=ROOT,
+                                env=dict(os.environ, JERRY_URL=SERVER))
+        proc.stdin.write((prompt + "\n").encode())
+        proc.stdin.close()
+        # interrupt while the tool is running, not while the model is
+        deadline = time.monotonic() + TIMEOUT
+        started = False
+        for raw in proc.stderr:
+            if re.search(r"jerry: \d+/\d+ .* tool", raw.decode("utf-8", "replace")):
+                started = True
+                break
+            if time.monotonic() > deadline:
+                break
+        if not started:
+            proc.kill()
+            self.fail("no meter update for the tool phase, nothing to interrupt")
+        proc.send_signal(signal.SIGINT)
+        err = proc.stderr.read()
+        code = proc.wait(timeout=60)
+        proc.stdout.close()
+        proc.stderr.close()
+        self.assertEqual(code, EXIT_KILLED)
+        self.assertIn("interrupted", err.decode("utf-8", "replace"))
+
+    def test_the_output_limit_counts_a_turn_and_not_the_whole_run(self):
+        """Five turns of one token each are under a limit of 3, so the run ends on the
+        turn limit, not on the output limit."""
+        prompt = "call the tool again and list the numbers 1 to 4"
+        r = Run(["-f", "--limit", "3", "--max-turns", "5", "-T", TOOLMOD, prompt], stdin=prompt)
+        if SERVER != MOCK_URL:
+            self.skipTest("only the mock calls a tool every turn")
+        self.assertEqual(r.code, EXIT_TOOL)
+        self.assertIn("kept asking for tools after 5 turns", r.err.decode())
+        self.assertNotIn("output limit reached", r.err.decode())
+
+    def test_the_session_is_the_first_message_then_the_call_and_its_answer(self):
+        if SERVER != MOCK_URL:
+            self.skipTest("the proof is the mock listing the messages it was sent")
+        prompt = "call the tool get_weather and list the messages"
+        r = self.tool_run([], prompt).assert_ok()
+        text = r.out.decode()
+        self.assertIn("message 0: user", text, "the session starts with the text it was given")
+        self.assertIn("message 1: assistant", text, "the model's own call is kept as a message")
+        self.assertIn("message 2: tool", text, "what the tool answered is sent back as a message")
+        self.assertNotIn("message 3:", text, "one call and one answer, then the model answered")
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description="tests for jerry (bundled mock server unless --server is given)")

@@ -10,6 +10,10 @@ jerry "tell me a story"                         # same, positional argument
 
 `tom` is a companion CLI for sending images (or any binary) alongside text to multimodal servers. See below.
 
+With `-T MODULE.py` `jerry` can run tools: every `tool_` function in that module is offered to
+the server, the call is run, and the result is fed back. Writing a tool module is meant to
+nothing more than writing a function — see [TOOLS.md](TOOLS.md).
+
 ---
 
 ## Installation
@@ -98,6 +102,9 @@ again, with the previous answer now part of the text.
 | `-t`, `--timeout` S | Socket timeout in seconds, default 600 (`JERRY_TIMEOUT`) |
 | `--limit` N | Explicit output token limit (overrides the default) |
 | `--no-stream` | Do not stream the response (no live meter) |
+| `-T`, `--tool` MODULE.py | Take tools from this module, repeatable (see [TOOLS.md](TOOLS.md)) |
+| `-L`, `--log` FILE | Append timestamped tool calls to a file (see [TOOLS.md](TOOLS.md)) |
+| `--max-turns` N | How many times the model may ask for tools in one run (default 8, see [TOOLS.md](TOOLS.md)) |
 | `-q`, `--quiet` | Suppress error messages too |
 | `--version` | Print version and exit |
 
@@ -116,6 +123,8 @@ configured once:
 | `JERRY_MODEL` | `-m`, `--model` | whatever the server reports |
 | `JERRY_SEED` | `-s`, `--seed` | `0` |
 | `JERRY_TIMEOUT` | `-t`, `--timeout` | `600` |
+| `JERRY_TOOL_LOG` | `-L`, `--log` | no log |
+| `JERRY_MAX_TURNS` | `--max-turns` | `8` |
 
 An option given on the command line always wins over the environment.
 
@@ -165,6 +174,7 @@ jerry: reasoning 268 chars, use -r to see it
 | 1 | Usage error |
 | 2 | Server / connection error |
 | 3 | Output limit reached |
+| 4 | Tool turn limit reached (tools in use) |
 | 130 | Interrupted (SIGINT) |
 
 ---
@@ -199,7 +209,7 @@ There is no client-side response cache: the only cache in play is the server's o
 ## Notes & limits
 
 - **`-f` is best effort.** The OpenAI protocol has no portable way to switch thinking off, so `jerry` sends `enable_thinking: false` (what llama.cpp chat templates use) and ignores it if the server does not. Reasoning is never in stdout either way, so `-f` mainly saves time on servers that support it.
-- **No tool support.** If the model requests a tool call, `jerry` prints the call, reports it on stderr, and stops with exit code 2.
+- **Tool support is only what you bring.** With `-T` `jerry` runs the tool functions in the modules given (see [TOOLS.md](TOOLS.md)); a tool that fails is reported to the model rather than ending the run. Without `-T` there is nothing to run: if the model requests a tool call, `jerry` prints the call, reports it on stderr, and stops with exit code 2.
 - **Only standard llama.cpp endpoints are used:** `POST /v1/chat/completions` (streaming SSE when possible, plain JSON otherwise) and `GET /v1/models` for the diagnostics line.
 - **Stock Python 3, standard library only.** No third-party dependencies.
 

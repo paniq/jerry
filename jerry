@@ -8,16 +8,25 @@ A single-shot, pipe friendly client for a llama.cpp server:
 
 The session is empty apart from the text it is given, the model is run until it
 returns control to the user, and the raw response is printed on stdout.
+
+With -T MODULE.py the model may ask for a tool instead of answering: every tool_
+function in that module is offered to the server, the call is run, and what it
+returns is fed back. See TOOLS.md.
 """
 
 import argparse
 import base64
+import contextlib
+import datetime
+import importlib.util
+import inspect
 import json
 import os
 import random
 import re
 import sys
 import time
+import typing
 import urllib.error
 import urllib.request
 
@@ -28,17 +37,25 @@ DEFAULT_URL = os.environ.get("JERRY_URL") or "http://localhost:8080"
 DEFAULT_SEED = int(os.environ.get("JERRY_SEED", "0"))
 DEFAULT_LIMIT = 32768
 DEFAULT_TIMEOUT = float(os.environ.get("JERRY_TIMEOUT", "600"))
+DEFAULT_TOOL_LOG = os.environ.get("JERRY_TOOL_LOG") or None
+DEFAULT_MAX_TURNS = int(os.environ.get("JERRY_MAX_TURNS", "8"))
 
-EXIT_OK, EXIT_USAGE, EXIT_SERVER, EXIT_LIMIT, EXIT_KILLED = 0, 1, 2, 3, 130
+EXIT_OK, EXIT_USAGE, EXIT_SERVER, EXIT_LIMIT, EXIT_TOOL, EXIT_KILLED = 0, 1, 2, 3, 4, 130
+
+TOOL_PREFIX = "tool_"
 
 EPILOG = """\
-exit codes: 0 ok, 1 usage error, 2 server error, 3 output limit reached, 130 interrupted
+exit codes: 0 ok, 1 usage error, 2 server error, 3 output limit reached, 4 tool turn limit reached, 130 interrupted
 
 environment:
-  JERRY_URL      server to talk to             (default http://localhost:8080)
-  JERRY_MODEL    model name to send            (default: whatever the server reports)
-  JERRY_SEED     default seed                  (default 0)
-  JERRY_TIMEOUT  socket timeout in seconds     (default 600)
+  JERRY_URL       server to talk to             (default http://localhost:8080)
+  JERRY_MODEL     model name to send            (default: whatever the server reports)
+  JERRY_SEED      default seed                  (default 0)
+  JERRY_TIMEOUT   socket timeout in seconds     (default 600)
+  JERRY_TOOL_LOG  file to append tool calls to  (default: none)
+  JERRY_MAX_TURNS tool turns per run            (default 8)
+
+tool calling: see TOOLS.md
 
 examples:
   cat instructions.txt | jerry
@@ -46,12 +63,31 @@ examples:
   cat instructions.txt | jerry -v -r
   jerry -s "tell me a story"                 # random seed, one off answer
   jerry -s 1234 "tell me a story"            # the same story every time
+  echo "what is the weather in Paris?" | jerry -T tools/weather.py -v
 """
 
 
+class UsageError(Exception):
+    """A problem with what was given on the command line: exit code 1."""
+
+
 def eprint(*args, **kwargs):
-    kwargs.setdefault("file", sys.stderr)
-    print(*args, **kwargs)
+    """A line on stderr, through the one ordered writer."""
+    say("err", " ".join(str(a) for a in args) + kwargs.get("end", "\n"))
+
+
+def say(channel, text):
+    """Write through the ordered writer; straight out when no run is in progress."""
+    if ACTIVE is not None:
+        ACTIVE.write(channel, text)
+        return
+    try:
+        stream = sys.stdout if channel == "out" else sys.stderr
+        stream.write(text)
+        stream.flush()
+    except BrokenPipeError:
+        silence_stdout()
+        raise
 
 
 def log(args, msg):
@@ -103,6 +139,14 @@ def parse_args(argv):
                     help="seed, fixed by default so the same input can give the same output "
                          "(on servers that honour it); no argument picks a random one")
 
+    # tools (see TOOLS.md)
+    ap.add_argument("-T", "--tool", action="append", metavar="MODULE.py",
+                    help="python module to take tools from, every tool_ function in it is a tool "
+                         "(repeatable; every function not named tool_* is left alone)")
+    ap.add_argument("-L", "--log", default=DEFAULT_TOOL_LOG, metavar="FILE",
+                    help="append timestamped tool calls to FILE (default: %s)" %
+                         (DEFAULT_TOOL_LOG or "no log"))
+
     # extras
     ap.add_argument("-i", "--input", help="read the text from a file ('-' for stdin)")
     ap.add_argument("-o", "--output", help="write the response to a file instead of stdout")
@@ -114,10 +158,15 @@ def parse_args(argv):
                     help="socket timeout in seconds (default %d)" % DEFAULT_TIMEOUT)
     ap.add_argument("--limit", type=int, help="explicit output token limit, overrides the default")
     ap.add_argument("--no-stream", action="store_true", help="do not stream (no live progress meter)")
+    ap.add_argument("--max-turns", type=int, default=DEFAULT_MAX_TURNS,
+                    help="how many times the model may ask for tools in one run (default %d)" % DEFAULT_MAX_TURNS)
     ap.add_argument("-q", "--quiet", action="store_true", help="no error messages either")
     ap.add_argument("--version", action="version", version="%s %s" % (PROG, VERSION))
 
-    return ap.parse_args(argv)
+    args = ap.parse_args(argv)
+    if args.max_turns < 1:
+        ap.error("--max-turns must be at least 1")
+    return args
 
 
 # --------------------------------------------------------------------------- #
@@ -190,6 +239,121 @@ def build_messages(args, text):
 
 
 # --------------------------------------------------------------------------- #
+# the one ordered writer
+# --------------------------------------------------------------------------- #
+
+def silence_stdout():
+    """The reader hung up. Point stdout at /dev/null so the flush the interpreter
+    does at exit cannot fail again (that is what produced exit code 120 and the
+    'Exception ignored' message on stderr)."""
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        os.close(devnull)
+    except (OSError, ValueError):
+        pass
+
+
+ACTIVE = None          # the writer for the current run
+
+
+class Writer:
+    """Everything printed goes through one writer, so nothing comes out of order.
+
+    The response (stdout or -o FILE), the diagnostics (stderr) and the tool log all
+    share the same order of events. While a tool runs, sys.stdout and sys.stderr
+    point at this writer as well, so a tool that uses print() is written in the same
+    order as jerry's own lines.
+
+    When the meter owns stderr on a terminal nothing can be mixed into its line:
+    events are recorded and written in that order once the run is over.
+    """
+
+    def __init__(self, args, meter, log_fh=None):
+        self.args = args
+        self.meter = meter
+        self.out_fh = open(args.output, "w", encoding="utf-8") if args.output else sys.stdout
+        self.err_fh = sys.stderr              # the real stderr, not what a tool is given
+        self.log_fh = log_fh
+        self.hold = meter.clean
+        self.pending = []
+        self.wrote = ""
+
+    def write(self, channel, text):
+        if not text:
+            return
+        if channel == "out":
+            self.wrote += text
+        if self.hold:
+            self.pending.append((channel, text))
+        else:
+            self.emit(channel, text)
+
+    def emit(self, channel, text):
+        fh = {"out": self.out_fh, "err": self.err_fh, "log": self.log_fh}.get(channel)
+        if fh is None:
+            return
+        try:
+            fh.write(text)
+            fh.flush()
+        except BrokenPipeError:
+            if channel == "out":
+                silence_stdout()
+            raise
+
+    def flush(self):
+        """Write what was recorded, in the order it was recorded, and clear it."""
+        for channel, text in self.pending:
+            self.emit(channel, text)
+        self.pending = []
+
+    def close(self):
+        try:
+            self.flush()
+            for fh in (self.out_fh, self.log_fh):
+                if fh is None:
+                    continue
+                fh.flush()
+                if fh not in (sys.stdout, sys.stderr):
+                    fh.close()
+        except BrokenPipeError:
+            silence_stdout()
+
+    @contextlib.contextmanager
+    def while_tools_run(self):
+        """What a tool sees instead of the channels."""
+        saved = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = Proxy(self, "out"), Proxy(self, "err")
+        try:
+            yield
+        finally:
+            sys.stdout, sys.stderr = saved
+
+
+class Proxy:
+    """A stand in for stdout/stderr for the duration of a tool call."""
+
+    def __init__(self, writer, channel):
+        self.writer = writer
+        self.channel = channel
+
+    def write(self, text):
+        self.writer.write(self.channel, text)
+        return len(text)
+
+    def flush(self):
+        # flushing while the meter owns stderr would put text into its line
+        if not self.writer.hold:
+            self.writer.flush()
+
+    def isatty(self):
+        return False
+
+    def fileno(self):
+        raise ValueError("not a real file")
+
+
+# --------------------------------------------------------------------------- #
 # progress meter (stderr, -v only)
 # --------------------------------------------------------------------------- #
 
@@ -207,7 +371,9 @@ class Meter:
         self.tty = sys.stderr.isatty()
         # on a terminal the meter owns stderr: nothing else is mixed into its line
         self.clean = self.tty and args.verbose
+        self.stream = sys.stderr
         self.tokens = 0
+        self.turn_tokens = 0            # the output limit is per request, not per run
         self.start = time.monotonic()
         self.first = None
         self.phase = "prompt"
@@ -220,6 +386,7 @@ class Meter:
 
     def tick(self, n=1):
         self.tokens += n
+        self.turn_tokens += n
         if n and self.first is None:
             self.first = time.monotonic() - self.start
         self.dirty = True
@@ -238,77 +405,233 @@ class Meter:
         else:
             head = "jerry: %d tokens (no limit)" % self.tokens
         line = "%s %5.1f t/s %5.1fs %s%s" % (head, rate, elapsed, self.phase, finish)
-        sys.stderr.write(("\r" if self.clean else "") + line + ("" if self.clean else "\n"))
-        sys.stderr.flush()
+        self.stream.write(("\r" if self.clean else "") + line + ("" if self.clean else "\n"))
+        self.stream.flush()
         self.dirty = False
 
     def done(self, finish="stop"):
         if self.args.verbose and self.dirty:
             self.render(finish)
             if self.clean:
-                sys.stderr.write("\n")
-                sys.stderr.flush()
+                self.stream.write("\n")
+                self.stream.flush()
             self.dirty = False
 
 
 # --------------------------------------------------------------------------- #
-# output
+# tools
 # --------------------------------------------------------------------------- #
 
-def silence_stdout():
-    """The reader hung up. Point stdout at /dev/null so the flush the interpreter
-    does at exit cannot fail again (that is what produced exit code 120 and the
-    'Exception ignored' message on stderr)."""
+JSON_TYPE = {str: "string", int: "integer", float: "number", bool: "boolean",
+            type(None): "null"}
+
+ARGS_HEADING = re.compile(r"^(Args|Arguments|Parameters)\s*:$", re.I)
+PARAM_LINE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*)$")
+
+
+def json_type(ann):
+    """One python annotation -> the JSON Schema fragment for it."""
+    if isinstance(ann, str) or ann is inspect.Parameter.empty:
+        return {}                                        # nothing can be said about it
     try:
-        devnull = os.open(os.devnull, os.O_WRONLY)
-        os.dup2(devnull, sys.stdout.fileno())
-        os.close(devnull)
-    except (OSError, ValueError):
-        pass
+        name = JSON_TYPE.get(ann)
+    except TypeError:                                    # an unhashable annotation
+        name = None
+    if name:
+        return {"type": name}
+
+    origin, args = typing.get_origin(ann), typing.get_args(ann)
+    if origin is typing.Union:
+        parts = [json_type(a) for a in args]
+        return parts[0] if len(parts) == 1 else {"anyOf": parts}
+    if origin is typing.Literal:
+        frag = {"enum": list(args)}
+        types = {JSON_TYPE.get(type(a)) for a in args}
+        if len(types) == 1 and types != {None}:
+            frag["type"] = types.pop()
+        return frag
+    if origin in (list, tuple, set, frozenset):
+        frag = {"type": "array"}
+        if args:
+            frag["items"] = json_type(args[0])
+        return frag
+    if origin is dict:
+        frag = {"type": "object"}
+        if len(args) == 2:
+            frag["additionalProperties"] = json_type(args[1])
+        return frag
+    if isinstance(ann, type):
+        # a bare list/dict, or anything else that has a shape of its own
+        if issubclass(ann, (list, tuple, set, frozenset)):
+            return {"type": "array"}
+        if issubclass(ann, dict):
+            return {"type": "object"}
+    return {}
 
 
-class Out:
-    """stdout (or -o FILE). `hold` keeps everything until the end so that a -v
-    meter on a terminal is not broken up by the response."""
+def parse_doc(doc):
+    """-> (description, {parameter: description}) from a Google style docstring."""
+    doc = (doc or "").strip()
+    if not doc:
+        return "", {}
 
-    def __init__(self, args, hold=False):
-        self.hold = hold
-        self.fh = open(args.output, "w", encoding="utf-8") if args.output else sys.stdout
-        self.wrote = ""
-        self.pending = ""
+    description, params, current = [], {}, None
+    for raw in doc.splitlines():
+        line = raw.strip()
+        if current is None and not line:
+            continue
+        if current is not None:
+            match = PARAM_LINE.match(line)
+            if match:
+                current = match.group(1)
+                params[current] = match.group(2)
+            elif params.get(current):
+                params[current] += " " + line
+            continue
+        if ARGS_HEADING.match(line):
+            current = ""
+            continue
+        description.append(line)
 
-    def write(self, text):
-        if not text:
-            return
-        self.pending += text
-        self.wrote += text
-        if not self.hold:
+    return " ".join(description).strip(), params
+
+
+def hints_of(fn):
+    """The annotations of a function, resolved when they were left as strings."""
+    try:
+        return typing.get_type_hints(fn)
+    except Exception:
+        return dict(getattr(fn, "__annotations__", {}))
+
+
+def tool_spec(fn):
+    """The JSON RPC metadata for one tool function, read from its declaration.
+
+    The name is the function name without the tool_ prefix, the description is the
+    first block of the docstring, every parameter gets its annotation as a JSON
+    Schema type and its Args entry as a description, and a parameter with a default
+    is not required.
+    """
+    description, documented = parse_doc(fn.__doc__)
+    declared = hints_of(fn)
+    signature = inspect.signature(fn)
+
+    properties, required = {}, []
+    for name, parameter in signature.parameters.items():
+        if parameter.kind in (parameter.VAR_POSITIONAL, parameter.VAR_KEYWORD):
+            continue                                   # not something the model can pass
+        entry = json_type(declared.get(name, parameter.annotation))
+        if name in documented:
+            entry["description"] = documented[name]
+        if parameter.default is parameter.empty:
+            required.append(name)
+        else:
             try:
-                self.fh.write(text)
-                self.fh.flush()
-            except BrokenPipeError:
-                silence_stdout()
-                raise
+                entry["default"] = json.loads(json.dumps(parameter.default))
+            except (TypeError, ValueError):
+                entry["default"] = str(parameter.default)
+        properties[name] = entry
 
-    def flush(self):
-        if self.hold and self.pending:
-            try:
-                self.fh.write(self.pending)
-                self.fh.flush()
-            except BrokenPipeError:
-                silence_stdout()
-                raise
-            self.pending = ""
+    return {"name": fn.__name__[len(TOOL_PREFIX):],
+            "description": description or fn.__name__,
+            "parameters": {"type": "object", "properties": properties, "required": required}}
 
-    def close(self):
-        try:
-            self.flush()
-            if self.fh is not sys.stdout:
-                self.fh.close()
-            else:
-                sys.stdout.flush()
-        except BrokenPipeError:
-            silence_stdout()
+
+def load_tool_module(path):
+    """Import a python file as a module, the way jerry is run without a .py extension."""
+    name = os.path.splitext(os.path.basename(path))[0]
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise UsageError("cannot read the tool module %s" % path)
+    module = importlib.util.module_from_spec(spec)
+    directory = os.path.dirname(os.path.abspath(path))
+    if directory not in sys.path:
+        sys.path.insert(0, directory)                  # so a tool module can import its neighbours
+    try:
+        spec.loader.exec_module(module)
+    except Exception as exc:
+        raise UsageError("cannot load the tool module %s: %s" % (path, exc))
+    return module
+
+
+def build_registry(args):
+    """-> {tool name: (function, spec)} for every tool_ function in every module given."""
+    registry = {}
+    for path in args.tool or []:
+        module = load_tool_module(path)
+        found = {n: f for n, f in vars(module).items() if n.startswith(TOOL_PREFIX) and callable(f)}
+        if not found:
+            raise UsageError("%s exports no tool_ functions" % path)
+        for name in sorted(found):
+            short = name[len(TOOL_PREFIX):]
+            if short in registry:
+                raise UsageError("%s and %s both define tool %s" % (registry[short][2], path, short))
+            registry[short] = (found[name], tool_spec(found[name]), path)
+    return registry
+
+
+def tool_text(value):
+    """What the model sees for the result of a tool."""
+    if value is None:
+        return "no result"                             # a tool that only printed
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def stamp():
+    """Local time with the offset, the way the tool log wants it."""
+    return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def canonical(arguments):
+    """Arguments as one JSON string, so the log and the request read the same way."""
+    try:
+        return json.dumps(json.loads(arguments), sort_keys=True, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return arguments
+
+
+def report_call(args, writer, turn, name, arguments, result, start):
+    """One call, reported the same way whatever it was, and logged."""
+    log(args, "tool  %s -> %s (%.2fs)" % (name, result, time.monotonic() - start))
+    if writer.log_fh:
+        writer.write("log", "%s turn %d %s %s -> %s (%.2fs)\n" % (
+            stamp(), turn, name, canonical(arguments), result, time.monotonic() - start))
+    return result
+
+
+def call_tool(args, writer, meter, registry, name, arguments, turn):
+    """Run one tool and return the text fed back to the model. Nothing here is fatal."""
+    start = time.monotonic()
+    meter.set_phase("tool")
+    entry = registry.get(name)
+    if entry is None:
+        return report_call(args, writer, turn, name, arguments, "no tool named %s" % name, start)
+
+    fn = entry[0]
+    log(args, "tool  %s(%s)" % (name, canonical(arguments)))
+
+    try:
+        given = json.loads(arguments) if isinstance(arguments, str) else arguments
+    except ValueError:
+        return report_call(args, writer, turn, name, arguments,
+                           "the arguments are not valid json: %s" % arguments, start)
+    if not isinstance(given, dict):
+        return report_call(args, writer, turn, name, arguments,
+                           "the arguments are not an object: %s" % canonical(arguments), start)
+
+    try:
+        with writer.while_tools_run():
+            value = fn(**given)
+    except Exception as exc:
+        # a tool that fails is the model's problem to react on, not jerry's
+        return report_call(args, writer, turn, name, arguments,
+                           "tool %s failed: %s: %s" % (name, type(exc).__name__, exc), start)
+    return report_call(args, writer, turn, name, arguments, tool_text(value), start)
 
 
 # --------------------------------------------------------------------------- #
@@ -337,8 +660,12 @@ def model_name(args):
     return "local-model"
 
 
-def build_payload(args, messages, seed):
-    limit = 0 if args.big else (args.limit if args.limit is not None else DEFAULT_LIMIT)
+def output_limit(args):
+    return 0 if args.big else (args.limit if args.limit is not None else DEFAULT_LIMIT)
+
+
+def build_payload(args, messages, seed, registry=None):
+    limit = output_limit(args)
     payload = {"messages": messages, "stream": not args.no_stream, "seed": seed}
     if args.model:
         payload["model"] = args.model
@@ -348,15 +675,19 @@ def build_payload(args, messages, seed):
         # not in the OpenAI protocol, but this is what llama.cpp chat templates use;
         # harmless on servers that ignore it
         payload["enable_thinking"] = False
+    if registry:
+        # the tools are sent in name order, so the request does not depend on the
+        # order the modules were given in
+        payload["tools"] = [{"type": "function", "function": registry[name][1]} for name in sorted(registry)]
     return payload, limit
 
 
-def finish_code(args, finish, limit):
+def finish_code(args, finish, limit, registry=None):
     if finish == "length":
         report(args, "output limit reached (%s tokens), the response is incomplete; "
                      "use -b for no limit or --limit N" % limit)
         return EXIT_LIMIT
-    if finish in ("tool_calls", "tool_case"):
+    if finish in ("tool_calls", "tool_case") and not registry:
         report(args, "the model requested a tool call, jerry has no tools to run; stopping")
         return EXIT_SERVER
     return EXIT_OK
@@ -367,7 +698,22 @@ def new_data():
             "usage": {}, "timings": {}}
 
 
-def take(args, part, data, meter, out, flush=False):
+def merge(total, data):
+    """Add one turn to what the summary will report."""
+    total["content"] += data["content"]
+    total["reasoning"] += data["reasoning"]
+    total["tool_calls"].extend(data["tool_calls"])
+    total["finish"] = data["finish"] or total["finish"]
+    for key in ("usage", "timings"):
+        for name, value in (data.get(key) or {}).items():
+            if isinstance(value, (int, float)) and isinstance(total[key].get(name), (int, float)):
+                # numbers add up over the turns; anything else is kept as it was first seen
+                total[key][name] = total[key].get(name, 0) + value
+            elif name not in total[key]:
+                total[key][name] = value
+
+
+def take(args, part, data, meter, writer, flush=False):
     """Handle one delta, or a whole message when not streaming.
 
     Live output only happens when stderr is not owned by the meter; otherwise
@@ -386,15 +732,29 @@ def take(args, part, data, meter, out, flush=False):
     if content:
         data["content"] += content
         meter.tick(1 if not flush else max(1, len(content) // 4))
-        out.write(content)
+        writer.write("out", content)
 
     for call in calls:
         fn = call.get("function", call)
-        data["tool_calls"].append({"name": fn.get("name"), "arguments": fn.get("arguments")})
+        index = call.get("index") if call.get("index") is not None else len(data["tool_calls"])
+        entry = next((c for c in data["tool_calls"] if c["index"] == index), None)
+        if entry is None:
+            entry = {"index": index, "id": call.get("id") or "call_%d" % (index + 1),
+                     "name": fn.get("name"), "arguments": ""}
+            data["tool_calls"].append(entry)
+        # an argument can arrive in pieces, and some servers send the whole call as an
+        # object instead of a string, so the call is built up as it comes
+        if fn.get("name"):
+            entry["name"] = fn.get("name")
+        if call.get("id"):
+            entry["id"] = call.get("id")
+        part = fn.get("arguments")
+        if part:
+            entry["arguments"] += part if isinstance(part, str) else json.dumps(part)
         meter.tick(1)
 
 
-def run(args, payload, limit, meter, out):
+def run(args, payload, limit, meter, writer):
     """One generation: the whole session, until the model hands control back."""
     url = args.url.rstrip("/") + "/v1/chat/completions"
     request = urllib.request.Request(
@@ -416,6 +776,7 @@ def run(args, payload, limit, meter, out):
         return server_report(args, "cannot reach %s: %s" % (url, exc))
 
     result = new_data()
+    meter.turn_tokens = 0
 
     if "event-stream" in (resp.headers.get("Content-Type") or ""):
         meter.set_phase("streaming")
@@ -435,12 +796,12 @@ def run(args, payload, limit, meter, out):
                 continue
             for choice in chunk.get("choices") or []:
                 part = choice.get("delta") or choice.get("message") or {}
-                take(args, part, result, meter, out)
+                take(args, part, result, meter, writer)
                 if choice.get("finish_reason"):
                     result["finish"] = choice["finish_reason"]
             result["usage"] = chunk.get("usage") or result["usage"]
             result["timings"] = chunk.get("timings") or result["timings"]
-            if limit and meter.tokens > limit:
+            if limit and meter.turn_tokens > limit:
                 report(args, "the server sent more than the agreed limit (%d tokens)" % limit)
                 result["finish"] = "length"
                 break
@@ -455,15 +816,65 @@ def run(args, payload, limit, meter, out):
         result["timings"] = doc.get("timings", {})
         choice = (doc.get("choices") or [{}])[0]
         part = choice.get("message") or choice.get("delta") or {}
-        take(args, part, result, meter, out, flush=True)
+        take(args, part, result, meter, writer, flush=True)
         result["finish"] = choice.get("finish_reason") or "stop"
 
     return result
 
 
 # --------------------------------------------------------------------------- #
+# the turns
+# --------------------------------------------------------------------------- #
+
+def call_messages(data, results):
+    """What has to be added to the session for the model to see the answer to its call."""
+    messages = [{"role": "assistant", "content": data["content"] or None,
+                 "tool_calls": [{"id": call["id"], "type": "function",
+                                 "function": {"name": call["name"], "arguments": call["arguments"]}}
+                                for call in data["tool_calls"]]}]
+    for call, result in zip(data["tool_calls"], results):
+        messages.append({"role": "tool", "tool_call_id": call["id"],
+                         "name": call["name"], "content": result})
+    return messages
+
+
+def session(args, messages, registry, seed, meter, writer):
+    """Ask, run what the model asked for, ask again, until it hands control back."""
+    total = new_data()
+    turn = 0
+
+    while True:
+        turn += 1
+        payload, limit = build_payload(args, messages, seed, registry)
+        meter.set_phase("prompt")
+        data = run(args, payload, limit, meter, writer)
+        if isinstance(data, int):
+            return data, total
+
+        merge(total, data)
+        code = finish_code(args, data["finish"], limit, registry)
+        if code != EXIT_OK:
+            if data["tool_calls"] and not registry:
+                for call in data["tool_calls"]:
+                    writer.write("out", "\n%s(%s)\n" % (call["name"], call["arguments"]))
+            return code, total
+
+        if not data["tool_calls"]:
+            return EXIT_OK, total
+
+        if turn >= args.max_turns:
+            report(args, "the model kept asking for tools after %d turns, stopping" % args.max_turns)
+            return EXIT_TOOL, total
+
+        results = [call_tool(args, writer, meter, registry, call["name"], call["arguments"], turn)
+                   for call in data["tool_calls"]]
+        messages.extend(call_messages(data, results))
+
+
+# --------------------------------------------------------------------------- #
 # main
 # --------------------------------------------------------------------------- #
+
 def summary(args, meter, data):
     """Final numbers, on stderr, only with -v."""
     usage = data.get("usage") or {}
@@ -494,49 +905,62 @@ def main(argv=None):
         report(args, "nothing to send: pipe text on stdin, use -i FILE, or pass it as an argument")
         return EXIT_USAGE
 
+    try:
+        registry = build_registry(args)
+    except UsageError as exc:
+        report(args, str(exc))
+        return EXIT_USAGE
+
+    log_fh = None
+    if args.log:
+        try:
+            log_fh = open(args.log, "a", encoding="utf-8")     # appended, never truncated
+        except OSError as exc:
+            report(args, "cannot write the tool log to %s: %s" % (args.log, exc))
+            return EXIT_USAGE
+
     seed_is_random = args.seed is None
     seed = random.randint(0, 2 ** 31 - 1) if seed_is_random else args.seed
     messages = build_messages(args, text)
-    payload, limit = build_payload(args, messages, seed)
 
-    meter = Meter(args, limit)
-    out = Out(args, hold=meter.clean)
+    meter = Meter(args, output_limit(args))
+    writer = Writer(args, meter, log_fh)
+
+    global ACTIVE
+    ACTIVE = writer
 
     try:
         if args.verbose:
             log(args, "server  %s" % args.url)
             log(args, "model   %s" % model_name(args))
             log(args, "seed    %d%s" % (seed, " (random)" if seed_is_random else ""))
-            log(args, "limit   %s tokens" % ("none (-b)" if not limit else limit))
+            log(args, "limit   %s tokens" % ("none (-b)" if not output_limit(args) else output_limit(args)))
             log(args, "reasoning %s" % ("off (-f)" if args.fast else "hidden"))
             log(args, "input   %d chars as %s message" % (len(text), "system" if args.system else "user"))
+            if registry:
+                log(args, "tools   %s" % ", ".join(sorted(registry)))
 
         # -e: the input is not clipped from the output, both are printed as one
         if args.echo:
-            out.write(text if text.endswith("\n") else text + "\n")
-            out.write("\n")
+            writer.write("out", text if text.endswith("\n") else text + "\n")
+            writer.write("out", "\n")
 
-        meter.set_phase("prompt")
-        data = run(args, payload, limit, meter, out)
-        if isinstance(data, int):
-            return data
+        code, total = session(args, messages, registry, seed, meter, writer)
 
-        meter.done(data["finish"] or "stop")
+        meter.done(total["finish"] or "stop")
 
         # when the meter owns stderr, everything is printed once the run is over
-        if meter.clean and args.reason and data["reasoning"]:
-            eprint(data["reasoning"])
+        if meter.clean and args.reason and total["reasoning"]:
+            writer.write("err", total["reasoning"] + "\n")
 
-        for call in data["tool_calls"]:
-            out.write("\n%s(%s)\n" % (call["name"], call["arguments"]))
-        if out.wrote and not out.wrote.endswith("\n"):
-            out.write("\n")
-        out.flush()
+        if writer.wrote and not writer.wrote.endswith("\n"):
+            writer.write("out", "\n")
+        writer.flush()
 
         if args.verbose:
-            summary(args, meter, data)
+            summary(args, meter, total)
 
-        return finish_code(args, data["finish"] or "stop", limit)
+        return code
     except BrokenPipeError:
         meter.done("stopped")
         return EXIT_OK
@@ -545,10 +969,10 @@ def main(argv=None):
         report(args, "interrupted")
         return EXIT_KILLED
     finally:
-        out.close()
+        writer.close()
         if meter.dirty and meter.clean:
-            sys.stderr.write("\n")
-            sys.stderr.flush()
+            meter.stream.write("\n")
+            meter.stream.flush()
 
 
 if __name__ == "__main__":
