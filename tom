@@ -1,14 +1,23 @@
 #!/usr/bin/env python3
-"""tom — Multimodal Attachment Processor.
+"""tom — a tag writer for jerry.
 
-Reads files, base64-encodes binaries, and wraps each payload with a unique
-<jerry:HEXD> tag pair. jerry scans the resulting stream for these tags and
-constructs a proper multimodal content array.
+Reads files, base64-encodes the binary ones, and wraps each payload in a matching
+<jerry:HEXD> tag pair. jerry reads those tags back and builds a multimodal content
+array.
 
-    echo "what's in this image?" | ./tom - pic1.png pic2.jpg
-    ./tom intro.txt - photo.png
+    echo "what's in this image?" | tom - pic1.png pic2.jpg | jerry
+    tom intro.txt - photo.png | jerry
+
+Files ending in .txt or .md go through verbatim inside the tags, everything else is
+base64-encoded with a data:...;base64 URI prefix, and a - emits stdin at that
+position. Files are read in the order they are given, and each payload gets its own
+random tag id.
+
+The ids exist only between tom and jerry: jerry strips them before anything is sent,
+so the same files always send the same content, and a run stays reproducible.
 """
 
+import argparse
 import base64
 import os
 import random
@@ -17,10 +26,56 @@ import sys
 PROG = "tom"
 VERSION = "1.0.0"
 
-EXIT_OK, EXIT_USAGE = 0, 1
+EXIT_OK, EXIT_USAGE, EXIT_KILLED = 0, 1, 130
 
-# Text extensions that are treated as plain text (no base64 encoding)
+# Text extensions that are passed through verbatim instead of base64-encoded
 TEXT_EXTS = {".txt", ".md"}
+
+MIME = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".bmp": "image/bmp",
+    ".svg": "image/svg+xml",
+    ".pdf": "application/pdf",
+    ".txt": "text/plain",
+    ".md": "text/markdown",
+}
+
+EPILOG = """\
+exit codes: 0 ok, 1 usage error, 130 interrupted (a broken pipe also exits 0, as jerry does)
+
+examples:
+  echo "what's in this image?" | tom - photo.png | jerry
+  tom intro.txt - photo.png | jerry
+  tom photo1.png prompt.md photo2.jpg | jerry
+"""
+
+
+class Parser(argparse.ArgumentParser):
+    """argparse exits 2 on usage errors; tom documents usage errors as exit code 1."""
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        self.exit(EXIT_USAGE, "%s: error: %s\n" % (self.prog, message))
+
+
+def parse_args(argv):
+    ap = Parser(
+        prog=PROG,
+        description=__doc__.split("\n\n")[0],
+        epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument("files", nargs="*", help="files to send, in order ('-' means stdin)")
+    ap.add_argument("-q", "--quiet", action="store_true", help="no error messages either")
+    ap.add_argument("--version", action="version", version="%s %s" % (PROG, VERSION))
+    args = ap.parse_args(argv)
+    if not args.files:
+        ap.error("no files specified")
+    return args
 
 
 def eprint(*args, **kwargs):
@@ -28,94 +83,106 @@ def eprint(*args, **kwargs):
     print(*args, **kwargs)
 
 
+def report(args, msg):
+    if not args.quiet:
+        eprint("%s: %s" % (PROG, msg))
+
+
+class UsageError(Exception):
+    pass
+
+
 def random_tag_id():
-    """Generate a 12-character hex string."""
+    """A 12 character hex id, unique per payload."""
     return "".join(random.choices("0123456789abcdef", k=12))
 
 
 def is_text_file(path):
-    """Determine if a file should be treated as text."""
-    _, ext = os.path.splitext(path)
-    return ext.lower() in TEXT_EXTS
+    return os.path.splitext(path)[1].lower() in TEXT_EXTS
 
 
 def detect_mime(path):
-    """Detect MIME type from file extension."""
-    _, ext = os.path.splitext(path)
-    ext = ext.lower()
-    mime_map = {
-        ".png": "image/png",
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".gif": "image/gif",
-        ".webp": "image/webp",
-        ".bmp": "image/bmp",
-        ".svg": "image/svg+xml",
-        ".pdf": "application/pdf",
-        ".txt": "text/plain",
-        ".md": "text/markdown",
-    }
-    return mime_map.get(ext, "application/octet-stream")
+    return MIME.get(os.path.splitext(path)[1].lower(), "application/octet-stream")
+
+
+def tag_pair(tag_id, payload):
+    return "<jerry:%s>%s</jerry:%s>" % (tag_id, payload, tag_id)
+
+
+class Stdin:
+    """Stdin, read at most once, at the position of the first -."""
+
+    def __init__(self, args):
+        self.args = args
+        self.used = False
+
+    def read(self):
+        if self.used:
+            raise UsageError("stdin can only be read once, so - cannot appear twice")
+        if sys.stdin.isatty():
+            raise UsageError("nothing piped on stdin for -")
+        self.used = True
+        return sys.stdin.read()
 
 
 def process_file(path):
-    """Process a single file and return (is_attachment, tag_id, payload) or None for stdin passthrough."""
+    """-> (tag_id, payload), or None for a stdin passthrough."""
     if path == "-":
-        # Stdin: pass through verbatim, no wrapping
         return None
-
-    tag_id = random_tag_id()
-    is_text = is_text_file(path)
 
     try:
         with open(path, "rb") as fh:
             raw = fh.read()
     except OSError as exc:
-        eprint("%s: cannot read %s: %s" % (PROG, path, exc))
-        sys.exit(EXIT_USAGE)
+        raise UsageError("cannot read %s: %s" % (path, exc))
 
-    if is_text:
-        payload = raw.decode("utf-8", errors="replace")
-        return (False, tag_id, payload)
-    else:
-        # Binary: base64-encode
-        mime = detect_mime(path)
-        encoded = base64.b64encode(raw).decode("ascii")
-        payload = "data:%s;base64,%s" % (mime, encoded)
-        return (True, tag_id, payload)
+    if is_text_file(path):
+        return random_tag_id(), raw.decode("utf-8", errors="replace")
+
+    encoded = base64.b64encode(raw).decode("ascii")
+    return random_tag_id(), "data:%s;base64,%s" % (detect_mime(path), encoded)
 
 
-def format_payload(is_attachment, tag_id, payload):
-    """Format a payload with the tag brackets."""
-    return "<jerry:%s>%s</jerry:%s>" % (tag_id, payload, tag_id)
+def silence_stdout():
+    """Point stdout at /dev/null so the flush at exit cannot fail again (jerry does
+    the same, which is what keeps a broken pipe from exiting 120)."""
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        os.close(devnull)
+    except (OSError, ValueError):
+        pass
 
 
-def main():
-    args = sys.argv[1:]
-
-    if not args:
-        eprint("%s: no files specified" % PROG)
+def main(argv=None):
+    args = parse_args(argv)
+    stdin = Stdin(args)
+    try:
+        for path in args.files:
+            result = process_file(path)
+            if result is None:
+                # stdin passes through byte for byte, at its position in the order
+                sys.stdout.write(stdin.read())
+            else:
+                tag_id, payload = result
+                sys.stdout.write(tag_pair(tag_id, payload))
+                sys.stdout.write("\n")
+        sys.stdout.flush()
+    except BrokenPipeError:
+        silence_stdout()
+        return EXIT_OK
+    except KeyboardInterrupt:
+        report(args, "interrupted")
+        return EXIT_KILLED
+    except UsageError as exc:
+        report(args, str(exc))
         return EXIT_USAGE
-
-    for path in args:
-        result = process_file(path)
-        if result is None:
-            # Stdin passthrough
-            stdin_data = sys.stdin.read()
-            sys.stdout.write(stdin_data)
-            sys.stdout.flush()
-        else:
-            is_attachment, tag_id, payload = result
-            output = format_payload(is_attachment, tag_id, payload)
-            sys.stdout.write(output)
-            sys.stdout.write("\n")
-            sys.stdout.flush()
-
     return EXIT_OK
 
 
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except KeyboardInterrupt:
-        sys.exit(130)
+    except BrokenPipeError:
+        silence_stdout()
+        sys.exit(EXIT_OK)

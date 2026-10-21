@@ -11,6 +11,10 @@ depend on the prompt:
     "call the tool"             a tool call, finish_reason "tool_calls"
     anything else               "mock reply for: <prompt>"
 
+Message content is taken either as a plain string or as a multimodal content
+array; the array is flattened to text, with one <image> marker per image so the
+canned answer can show that the attachments arrived.
+
 Unless the request sets enable_thinking to false, an answer starts with 12
 reasoning tokens (reasoning_content). Reasoning counts towards max_tokens, and
 an answer that does not fit ends with finish_reason "length", like llama.cpp.
@@ -33,6 +37,30 @@ PORT = int(os.environ.get("MOCK_PORT", "8081"))
 TOKEN_DELAY = float(os.environ.get("MOCK_TOKEN_DELAY", "0.01"))   # seconds per streamed token
 
 STORY = "the old key turned in the lock and the door opened onto a quiet garden".split()
+
+# llama.cpp charges a vision slot for every image tile, so prompt_tokens is not
+# just the text length divided by four. This is a stand-in, not a real count.
+VISION_TOKENS = 256
+
+
+def prompt_text(content):
+    """Flatten message content (a string, or a multimodal content array) to text."""
+    if isinstance(content, str):
+        return content
+    parts = []
+    for part in content or []:
+        if part.get("type") == "text":
+            parts.append(part.get("text", ""))
+        elif part.get("type") == "image_url":
+            parts.append("<image>")
+    return " ".join(p for p in parts if p)
+
+
+def count_images(content):
+    """Number of image entries in a content array (0 for plain string content)."""
+    if isinstance(content, str):
+        return 0
+    return sum(1 for part in content or [] if part.get("type") == "image_url")
 
 
 def plan(prompt, req):
@@ -62,8 +90,9 @@ def answer(prompt, req):
     return seq, call, finish
 
 
-def stats(prompt, count):
-    usage = {"prompt_tokens": max(1, len(prompt) // 4), "completion_tokens": count}
+def stats(prompt, count, images=0):
+    usage = {"prompt_tokens": max(1, len(prompt) // 4) + images * VISION_TOKENS,
+             "completion_tokens": count}
     usage["total_tokens"] = usage["prompt_tokens"] + count
     timings = {"prompt_ms": 50.0, "predicted_ms": max(1.0, count * TOKEN_DELAY * 1000.0)}
     return usage, timings
@@ -91,9 +120,10 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             req = {}
         messages = req.get("messages") or [{}]
-        prompt = messages[0].get("content") or ""
+        content = messages[0].get("content") or ""
+        prompt = prompt_text(content)
         seq, call, finish = answer(prompt, req)
-        usage, timings = stats(prompt, len(seq))
+        usage, timings = stats(prompt, len(seq), count_images(content))
         if req.get("stream", True):
             self._stream(seq, call, finish, usage, timings)
         else:

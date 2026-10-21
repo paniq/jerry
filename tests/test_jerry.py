@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Tests for jerry.
+"""Tests for jerry and tom.
 
 Every test checks a behaviour documented in ../README.md. By default the suite
 starts the mock server in mock_server.py on a free port and talks to that, so it
 needs no model and takes seconds. To check a real llama.cpp server instead, point
-the suite at it; tests that need a server are skipped if it does not answer.
+the suite at it; tests that need a server are skipped if it does not answer, and
+the ones whose proof is a canned mock answer skip themselves against a real model.
 
-    python3 tests/test_jerry.py                  # bundled mock server; `tests/mock_server.py` now tests against `jerry`.
+    python3 tests/test_jerry.py                  # bundled mock server on a free port
     python3 tests/test_jerry.py --server URL     # a real server (or JERRY_TEST_URL)
-    python3 tests/test_jerry.py -k pipe          # run a subset
+    python3 tests/test_jerry.py -k broken_pipe   # run a subset (matches the test name)
 
 Against a real server the run time is dominated by the model, and some tests skip
 themselves when the model does not produce what they need (reasoning, a seeded
@@ -16,6 +17,7 @@ repeat); the mock always produces it.
 """
 
 import argparse
+import base64
 import contextlib
 import fcntl
 import io
@@ -37,6 +39,7 @@ from importlib import util as importlib_util
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 JERRY = os.path.join(ROOT, "jerry")
+TOM = os.path.join(ROOT, "tom")
 README = os.path.join(ROOT, "README.md")
 
 sys.path.insert(0, HERE)
@@ -48,6 +51,14 @@ SERVER = os.environ.get("JERRY_TEST_URL") or None
 TIMEOUT = float(os.environ["JERRY_TEST_TIMEOUT"]) if os.environ.get("JERRY_TEST_TIMEOUT") else None
 
 EXIT_OK, EXIT_USAGE, EXIT_SERVER, EXIT_LIMIT, EXIT_KILLED = 0, 1, 2, 3, 130
+
+
+def readme_flags(heading):
+    """Flags documented in a README table under the given heading."""
+    with open(README) as fh:
+        text = fh.read()
+    section = text.split(heading, 1)[1].split("\n---", 1)[0]
+    return re.findall(r"^\| `(-{1,2}[A-Za-z-]+)", section, re.M)
 
 
 def reachable(url, timeout=10):
@@ -97,12 +108,20 @@ class LiveCase(unittest.TestCase):
 
 def load_jerry(env=None):
     """Import jerry as a module (the file has no .py extension) with a given env."""
+    return load_module("jerry_under_test", JERRY, env)
+
+
+def load_tom(env=None):
+    """Import tom as a module, same trick as load_jerry."""
+    return load_module("tom_under_test", TOM, env)
+
+
+def load_module(name, path, env=None):
     saved = dict(os.environ)
     try:
         if env:
             os.environ.update(env)
-        name = "jerry_under_test"
-        loader = importlib_machinery.SourceFileLoader(name, JERRY)
+        loader = importlib_machinery.SourceFileLoader(name, path)
         spec = importlib_util.spec_from_loader(name, loader)
         mod = importlib_util.module_from_spec(spec)
         loader.exec_module(mod)
@@ -113,6 +132,7 @@ def load_jerry(env=None):
 
 
 JERRY_MOD = load_jerry()
+TOM_MOD = load_tom()
 
 
 @contextlib.contextmanager
@@ -128,6 +148,24 @@ def captured_stderr():
 
 def nonblock(fd):
     fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) | os.O_NONBLOCK)
+
+
+def run_tom(argv, stdin="", env=None):
+    """One run of tom as a subprocess (so the exit codes, --help and the pipes are real)."""
+    merged = dict(os.environ)
+    merged.update(env or {})
+    return subprocess.run([TOM] + list(argv), input=(stdin or "").encode(), capture_output=True,
+                          cwd=ROOT, timeout=TIMEOUT, env=merged)
+
+
+def tom_then_jerry(tom_args, jerry_args=(), stdin=""):
+    """Run tom, feed what it produced to jerry. -> (tom run, jerry run)"""
+    t = run_tom(tom_args, stdin)
+    if t.returncode != EXIT_OK:
+        return t, None
+    j = subprocess.run([JERRY] + list(jerry_args), input=t.stdout, capture_output=True,
+                       cwd=ROOT, timeout=TIMEOUT, env=dict(os.environ, JERRY_URL=SERVER))
+    return t, j
 
 
 class Run:
@@ -250,8 +288,7 @@ class TestReadmeSpec(unittest.TestCase):
             self.assertIn(" %d " % code, r.stdout, "help should list exit code %d" % code)
 
     def test_help_lists_every_documented_flag(self):
-        with open(README) as fh:
-            flags = re.findall(r"^\| `(-{1,2}[A-Za-z-]+)", fh.read(), re.M)
+        flags = readme_flags("## Options")
         self.assertTrue(flags, "no flags found in the README option table")
         r = subprocess.run([JERRY, "--help"], capture_output=True, text=True)
         for flag in flags:
@@ -264,18 +301,20 @@ class TestReadmeSpec(unittest.TestCase):
         self.assertIn("600", r.stdout)
 
     def test_stock_python3_standard_library_only(self):
-        with open(JERRY) as fh:
-            src = fh.read()
-        self.assertEqual(src.splitlines()[0], "#!/usr/bin/env python3")
-        mods = set(re.findall(r"^(?:import|from)\s+([A-Za-z_][A-Za-z0-9_.]*)", src, re.M))
-        stdlib = set(sys.stdlib_module_names)
-        for mod in mods:
-            self.assertIn(mod.split(".")[0], stdlib,
-                          "%s is not standard library" % mod)
+        for path in (JERRY, TOM):
+            with open(path) as fh:
+                src = fh.read()
+            self.assertEqual(src.splitlines()[0], "#!/usr/bin/env python3")
+            mods = set(re.findall(r"^(?:import|from)\s+([A-Za-z_][A-Za-z0-9_.]*)", src, re.M))
+            stdlib = set(sys.stdlib_module_names)
+            for mod in mods:
+                self.assertIn(mod.split(".")[0], stdlib,
+                              "%s is not standard library" % mod)
 
     def test_no_client_side_response_cache(self):
-        with open(JERRY) as fh:
-            self.assertNotIn("cache", fh.read().lower())
+        for path in (JERRY, TOM):
+            with open(path) as fh:
+                self.assertNotIn("cache", fh.read().lower())
 
     def test_no_shell_and_no_prompt_decoration(self):
         with open(JERRY) as fh:
@@ -359,6 +398,153 @@ class TestReadmeSpec(unittest.TestCase):
             JERRY_MOD.report(JERRY_MOD.parse_args(["-q"]), "quiet message")
             JERRY_MOD.report(JERRY_MOD.parse_args([]), "shown message")
         self.assertEqual(buf.getvalue(), "jerry: shown message\n")
+
+
+# --------------------------------------------------------------------------- #
+# tom: the tag writer
+# --------------------------------------------------------------------------- #
+
+def tom_payloads(text):
+    """Payloads inside tom's output, in the order they were declared."""
+    return [m.group(2) for m in re.finditer(r"<jerry:([0-9a-f]{12})>(.*?)</jerry:\1>", text, re.DOTALL)]
+
+
+def tom_ids(text):
+    return re.findall(r"<jerry:([0-9a-f]{12})>", text)
+
+
+class TestTom(unittest.TestCase):
+
+    def test_tag_pair_is_opened_and_closed_with_the_same_id(self):
+        out = run_tom(["tests/red.png"]).stdout.decode()
+        self.assertRegex(out, r"(?s)^<jerry:([0-9a-f]{12})>.*?</jerry:\1>\n$", "tom must write a matched pair")
+
+    def test_tag_ids_are_random_but_always_twelve_hex_chars(self):
+        ids = tom_ids(run_tom(["tests/red.png"]).stdout.decode())
+        self.assertEqual(len(ids), 1)
+        self.assertEqual(len(ids[0]), 12)
+        self.assertNotEqual(ids, tom_ids(run_tom(["tests/red.png"]).stdout.decode()))
+
+    def test_text_files_are_passed_verbatim_inside_the_tags(self):
+        path = os.path.join(ROOT, "tests", ".tmp_note.md")
+        with open(path, "w") as fh:
+            fh.write("the quick brown fox\n")
+        try:
+            out = run_tom([path]).stdout.decode()
+            self.assertIn("the quick brown fox", out)
+            self.assertNotIn("base64", out, "a .md file must not be encoded")
+        finally:
+            os.unlink(path)
+
+    def test_other_files_are_base64_with_a_data_uri_prefix(self):
+        payload = tom_payloads(run_tom(["tests/red.png"]).stdout.decode())[0]
+        self.assertTrue(payload.startswith("data:image/png;base64,"), payload[:40])
+        with open(os.path.join(ROOT, "tests", "red.png"), "rb") as fh:
+            self.assertEqual(base64.b64decode(payload.split(",", 1)[1]), fh.read(),
+                             "the payload must decode back to the file")
+
+    def test_mime_type_comes_from_the_extension(self):
+        cases = {("tests/blue.jpg", "image/jpeg"), ("tests/red.png", "image/png"),
+                 ("tests/.tmp_unknown.bin", "application/octet-stream")}
+        path = os.path.join(ROOT, "tests", ".tmp_unknown.bin")
+        with open(path, "wb") as fh:
+            fh.write(b"not an image")
+        try:
+            for file, mime in cases:
+                payload = tom_payloads(run_tom([file]).stdout.decode())[0]
+                self.assertTrue(payload.startswith("data:%s;base64," % mime),
+                                "%s should be %s, got %s" % (file, mime, payload[:30]))
+        finally:
+            os.unlink(path)
+
+    def test_stdin_passes_through_untagged_at_its_position(self):
+        md = os.path.join(ROOT, "tests", ".tmp_a.md")
+        bin_ = os.path.join(ROOT, "tests", ".tmp_b.bin")
+        with open(md, "w") as fh:
+            fh.write("the quick brown fox\n")
+        with open(bin_, "wb") as fh:
+            fh.write(b"not an image")
+        try:
+            out = run_tom([md, "-", bin_], stdin="piped text").stdout.decode()
+            pairs = [(m.group(2), m.start(), m.end())
+                     for m in re.finditer(r"<jerry:([0-9a-f]{12})>(.*?)</jerry:\1>", out, re.DOTALL)]
+            self.assertEqual(len(pairs), 2, "the text file and the binary file, in that order")
+            self.assertTrue(pairs[0][0].startswith("the quick brown fox"),
+                            "a .md file is passed verbatim, not encoded")
+            self.assertIn("piped text", out[pairs[0][2]:pairs[1][1]], "stdin must not be wrapped in a tag")
+            self.assertTrue(pairs[1][0].startswith("data:application/octet-stream;base64,"),
+                            "the binary file comes last")
+        finally:
+            os.unlink(md)
+            os.unlink(bin_)
+
+    def test_stdin_is_passed_through_byte_for_byte(self):
+        """No extra newline: tom adds one after a file, not after stdin."""
+        out = run_tom(["-"], stdin="two lines\nthen a blank\n\n").stdout.decode()
+        self.assertEqual(out, "two lines\nthen a blank\n\n")
+
+    def test_nothing_to_send_is_a_usage_error(self):
+        r = run_tom([], stdin="piped text")
+        self.assertEqual(r.returncode, EXIT_USAGE)
+        self.assertIn("no files specified", r.stderr.decode())
+
+    def test_unreadable_file_is_a_usage_error(self):
+        r = run_tom(["definitely-not-here.png"], stdin="")
+        self.assertEqual(r.returncode, EXIT_USAGE)
+        self.assertIn("cannot read", r.stderr.decode())
+
+    def test_stdin_can_only_be_read_once(self):
+        r = run_tom(["-", "-"], stdin="piped text")
+        self.assertEqual(r.returncode, EXIT_USAGE)
+        self.assertIn("cannot appear twice", r.stderr.decode())
+
+    def test_stdin_on_a_terminal_is_refused(self):
+        class TtyIn(io.StringIO):
+            def isatty(self):
+                return True
+
+        saved_in, saved_out = sys.stdin, sys.stdout
+        sys.stdin = TtyIn("piped text")
+        try:
+            with captured_stderr() as buf, contextlib.redirect_stdout(io.StringIO()):
+                code = TOM_MOD.main(["-"])
+        finally:
+            sys.stdin, sys.stdout = saved_in, saved_out
+        self.assertEqual(code, EXIT_USAGE)
+        self.assertIn("nothing piped on stdin", buf.getvalue())
+
+    def test_quiet_suppresses_the_message_but_not_the_exit_code(self):
+        r = run_tom(["definitely-not-here.png", "-q"], stdin="")
+        self.assertEqual(r.returncode, EXIT_USAGE)
+        self.assertEqual(r.stderr, b"")
+
+    def test_broken_pipe_exits_cleanly_and_silently(self):
+        r, w = os.pipe()
+        os.close(r)                     # tom is now writing into a closed pipe
+        proc = subprocess.Popen([TOM, "tests/red.png"], stdin=subprocess.DEVNULL, stdout=w,
+                                stderr=subprocess.PIPE, cwd=ROOT)
+        os.close(w)
+        err = proc.stderr.read()
+        code = proc.wait(timeout=30)
+        proc.stderr.close()
+        self.assertEqual(code, EXIT_OK, "broken pipe should exit 0, got %s" % code)
+        self.assertEqual(err, b"", "nothing belongs on stderr, got %r" % err)
+
+    def test_exit_codes_documented_in_help(self):
+        r = subprocess.run([TOM, "--help"], capture_output=True, text=True)
+        for code in (0, 1, 130):
+            self.assertIn(" %d " % code, r.stdout, "help should list exit code %d" % code)
+
+    def test_help_lists_every_documented_flag(self):
+        flags = readme_flags("### tom options")
+        self.assertTrue(flags, "no flags found in the tom table in the README")
+        r = subprocess.run([TOM, "--help"], capture_output=True, text=True)
+        for flag in flags:
+            self.assertIn(flag, r.stdout, "%s is documented in the README but missing from --help" % flag)
+
+    def test_version(self):
+        r = subprocess.run([TOM, "--version"], capture_output=True, text=True)
+        self.assertEqual(r.stdout.strip(), "tom %s" % TOM_MOD.VERSION)
 
 
 # --------------------------------------------------------------------------- #
@@ -456,6 +642,96 @@ class TestWhatJerrySends(unittest.TestCase):
         self.assertEqual(JERRY_MOD.parse_args([]).timeout, 600.0)
         self.assertEqual(load_jerry({"JERRY_URL": "http://example.test:1"}).parse_args([]).url,
                          "http://example.test:1")
+
+
+# --------------------------------------------------------------------------- #
+# what jerry makes of tom's tags
+# --------------------------------------------------------------------------- #
+
+def tagged(payload, tag=None):
+    """A well formed <jerry:HEXD> pair around a payload."""
+    tag = tag or "a" * 12
+    return "<jerry:%s>%s</jerry:%s>" % (tag, payload, tag)
+
+
+class TestMultimodalContent(unittest.TestCase):
+
+    def test_input_without_tags_is_still_plain_string_content(self):
+        self.assertIsNone(JERRY_MOD.parse_multimodal("plain text"))
+        self.assertEqual(JERRY_MOD.build_messages(JERRY_MOD.parse_args([]), "plain text"),
+                         [{"role": "user", "content": "plain text"}])
+
+    def test_data_payloads_become_image_url_entries(self):
+        self.assertEqual(JERRY_MOD.parse_multimodal(tagged("data:image/png;base64,AAA")),
+                         [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}}])
+
+    def test_payloads_that_are_not_data_are_text(self):
+        """tom writes .txt and .md files verbatim inside the tags."""
+        self.assertEqual(JERRY_MOD.parse_multimodal(tagged("a note")),
+                         [{"type": "text", "text": "a note"}])
+
+    def test_text_between_and_after_tags_keeps_its_own_entry(self):
+        entries = JERRY_MOD.parse_multimodal("before " + tagged("data:image/png;base64,AAA") + " after")
+        self.assertEqual([e["type"] for e in entries], ["text", "image_url", "text"])
+        self.assertEqual(entries[0]["text"], "before ")
+        self.assertEqual(entries[-1]["text"], " after")
+
+    def test_a_payload_spanning_lines_is_still_content(self):
+        """tom passes a text file through verbatim, so a tag can contain newlines."""
+        entries = JERRY_MOD.parse_multimodal(tagged("first line\nsecond line\n"))
+        self.assertEqual(entries, [{"type": "text", "text": "first line\nsecond line\n"}])
+
+    def test_nothing_is_emitted_for_an_empty_piece(self):
+        entries = JERRY_MOD.parse_multimodal(tagged("data:image/png;base64,AAA") + tagged("data:image/gif;base64,BBB"))
+        self.assertEqual(len(entries), 2, "two attachments, no empty text entry between them")
+        self.assertEqual([e["type"] for e in entries], ["image_url", "image_url"])
+
+    def test_order_of_the_attachments_is_kept(self):
+        md = os.path.join(ROOT, "tests", ".tmp_order.md")
+        with open(md, "w") as fh:
+            fh.write("a note between two images\n")
+        try:
+            text = run_tom(["tests/red.png", md, "tests/blue.jpg"]).stdout.decode()
+            entries = [e for e in JERRY_MOD.parse_multimodal(text)
+                       if e["type"] == "image_url" or e["text"].strip()]
+            self.assertEqual([e["type"] for e in entries], ["image_url", "text", "image_url"],
+                             "the attachments are kept in the order tom was given them")
+            self.assertIn("a note between two images", entries[1]["text"])
+        finally:
+            os.unlink(md)
+
+    def test_unpaired_tags_are_sent_as_the_text_they_are(self):
+        for text in (tagged("a") .replace("</jerry:" + "a" * 12, "</jerry:" + "b" * 12),
+                     "<jerry:" + "a" * 12 + ">no closing tag",
+                     "no opening tag</jerry:" + "a" * 12 + ">"):
+            self.assertIsNone(JERRY_MOD.parse_multimodal(text), "%r is not a matched pair" % text)
+            self.assertEqual(JERRY_MOD.build_messages(JERRY_MOD.parse_args([]), text)[0]["content"], text,
+                             "a broken pair is sent as the text it is")
+
+    def test_the_content_array_is_still_exactly_one_message(self):
+        messages = JERRY_MOD.build_messages(JERRY_MOD.parse_args([]), tagged("data:image/png;base64,AAA"))
+        self.assertEqual(len(messages), 1)
+        self.assertIsInstance(messages[0]["content"], list)
+
+    def test_capital_s_still_decides_the_role_for_content_arrays(self):
+        self.assertEqual(JERRY_MOD.build_messages(JERRY_MOD.parse_args(["-S"]),
+                                                  tagged("data:image/png;base64,AAA"))[0]["role"], "system")
+
+    def test_multimodal_adds_nothing_else_to_the_request(self):
+        payload, _ = JERRY_MOD.build_payload(JERRY_MOD.parse_args([]),
+                                             [{"role": "user", "content": [{"type": "text", "text": "x"}]}], 0)
+        self.assertEqual(sorted(payload), ["max_tokens", "messages", "seed", "stream"])
+
+    def test_the_content_array_carries_only_the_payloads(self):
+        """jerry builds the content from the payload, so the request depends on the files
+        alone: whatever ID tom picked, the same files send the same thing."""
+        a = run_tom(["tests/red.png"], stdin="what is in this image?").stdout.decode()
+        b = run_tom(["tests/red.png"], stdin="what is in this image?").stdout.decode()
+        self.assertNotEqual(a, b, "tom picks a new id every run, that is the point")
+        self.assertNotIn("<jerry:", json.dumps(JERRY_MOD.parse_multimodal(a)), "the request carries no tags")
+        self.assertEqual(json.dumps(JERRY_MOD.parse_multimodal(a)),
+                         json.dumps(JERRY_MOD.parse_multimodal(b)),
+                         "the same files must send the same content")
 
 
 # --------------------------------------------------------------------------- #
@@ -753,6 +1029,104 @@ class TestVerboseMeter(LiveCase):
         if a.out != b.out:
             self.skipTest("this server does not honour the seed (documented in the README)")
         self.assertEqual(a.out, b.out)
+
+
+# --------------------------------------------------------------------------- #
+# tom and jerry together, against a server
+# --------------------------------------------------------------------------- #
+
+class TestMultimodalLive(LiveCase):
+
+    def test_the_pipeline_works_end_to_end(self):
+        t, j = tom_then_jerry(["-", "tests/red.png"], stdin="what is in this image?")
+        self.assertEqual(t.returncode, EXIT_OK, t.stderr.decode())
+        self.assertEqual(j.returncode, EXIT_OK, j.stderr.decode())
+        self.assertTrue(j.stdout.strip(), "no response on stdout")
+        self.assertEqual(j.stderr, b"", "stderr must stay empty by default")
+        self.assertTrue(j.stdout.endswith(b"\n"))
+
+    def test_the_server_sees_the_content_array_not_the_tags(self):
+        """The mock only writes an <image> marker for a content array entry, so an answer
+        that contains one proves the tags were taken apart before the request."""
+        t, j = tom_then_jerry(["-", "tests/red.png"], stdin="what is in this image?")
+        answer = j.stdout.decode("utf-8", "replace")
+        self.assertNotIn("<jerry:", answer, "the tag ids must not reach the server")
+        if SERVER != MOCK_URL:
+            self.skipTest("the <image> marker is the mock's, so this half only runs here")
+        self.assertIn("<image>", answer, "the content array did not arrive")
+        self.assertIn("what is in this image?", answer)
+
+    def test_attachments_arrive_in_declaration_order(self):
+        if SERVER != MOCK_URL:
+            self.skipTest("the proof is the mock echoing the prompt back; a real model does not")
+        md = os.path.join(ROOT, "tests", ".tmp_order.md")
+        with open(md, "w") as fh:
+            fh.write("middle note")
+        try:
+            _, j = tom_then_jerry(["tests/red.png", md, "tests/blue.jpg"])
+            self.assertEqual(j.returncode, EXIT_OK, j.stderr.decode())
+            self.assertRegex(j.stdout.decode("utf-8", "replace"),
+                             r"mock reply for: <image>\s+middle note\s+<image>",
+                             "the order of the entries is the order tom was given")
+        finally:
+            os.unlink(md)
+
+    def test_the_same_files_get_the_same_answer_run_after_run(self):
+        """Random tag ids, identical requests: what the server sees does not depend on them."""
+        a = tom_then_jerry(["-", "tests/red.png"], stdin="what is in this image?")
+        b = tom_then_jerry(["-", "tests/red.png"], stdin="what is in this image?")
+        self.assertNotEqual(a[0].stdout, b[0].stdout, "tom picked a different id, as it should")
+        self.assertEqual(json.dumps(JERRY_MOD.parse_multimodal(a[0].stdout.decode())),
+                         json.dumps(JERRY_MOD.parse_multimodal(b[0].stdout.decode())),
+                         "the request is the same whatever ids tom picked")
+        if a[1].stdout != b[1].stdout:
+            self.skipTest("this server does not honour the seed (documented in the README)")
+        self.assertEqual(a[1].stdout, b[1].stdout)
+
+    def test_input_without_tags_is_sent_as_plain_string_content(self):
+        """Input with no matched tag pair is sent as it came in, unchanged."""
+        j = subprocess.run([JERRY], input=b"just text, no tags", capture_output=True,
+                           cwd=ROOT, timeout=TIMEOUT, env=dict(os.environ, JERRY_URL=SERVER))
+        self.assertEqual(j.returncode, EXIT_OK, j.stderr.decode())
+        if SERVER != MOCK_URL:
+            self.skipTest("the expected answer is the mock's canned one")
+        self.assertEqual(j.stdout.decode("utf-8", "replace").strip(),
+                         "mock reply for: just text, no tags")
+
+    def test_e_echoes_what_it_got_and_the_round_trip_rebuilds_the_same_content(self):
+        """-e prints the input as it came in, tags intact, so a tom answer can be fed back
+        into jerry and get a little more output."""
+        t, first = tom_then_jerry(["tests/red.png", "-"], ["-e"], stdin="what is in this image?")
+        echo = first.stdout.decode("utf-8", "replace")
+        sent = t.stdout.decode("utf-8", "replace")
+        self.assertEqual(echo[:len(sent)], sent, "-e must echo the input verbatim, tags and all")
+        self.assertEqual(tom_ids(echo), tom_ids(sent), "the ids must be the ones tom picked")
+
+        entries = JERRY_MOD.parse_multimodal(echo)
+        self.assertEqual(entries[0], {"type": "image_url", "image_url": {"url": tom_payloads(sent)[0]}},
+                         "the attachment must survive the round trip")
+        answer = echo[len(sent):].strip()
+        self.assertIn("what is in this image?", entries[1]["text"])
+        self.assertIn(answer, entries[1]["text"], "the first answer is now part of the input")
+
+        second = subprocess.run([JERRY], input=first.stdout, capture_output=True, cwd=ROOT,
+                                timeout=TIMEOUT, env=dict(os.environ, JERRY_URL=SERVER))
+        self.assertEqual(second.returncode, EXIT_OK, second.stderr.decode())
+        self.assertTrue(second.stdout.strip(), "the round trip produced nothing")
+        if SERVER == MOCK_URL:
+            self.assertIn(answer, second.stdout.decode("utf-8", "replace"),
+                          "the mock answers from the text it was sent, which is now the chain")
+
+    def test_an_image_with_no_text_at_all_still_reports_prompt_tokens(self):
+        """Nothing but an attachment: the summary line needs prompt_tokens to be more than
+        zero, so the mock charges a vision slot for the image."""
+        _, j = tom_then_jerry(["tests/red.png"], ["-v"])
+        self.assertEqual(j.returncode, EXIT_OK, j.stderr.decode())
+        reported = re.search(r"jerry: prompt  (\d+) tokens", j.stderr.decode("utf-8", "replace"))
+        self.assertTrue(reported, "the summary line needs prompt_tokens, so an image must count for something")
+        if SERVER == MOCK_URL:
+            self.assertGreater(int(reported.group(1)), mock_server.VISION_TOKENS,
+                               "the mock did not count the image in the prompt")
 
 
 if __name__ == "__main__":

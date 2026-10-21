@@ -53,10 +53,30 @@ tom photo1.png prompt.md photo2.jpg | jerry
 
 - Files ending in `.txt` or `.md` are passed verbatim inside tags.
 - All other files are base64-encoded with a `data:…;base64,…` URI prefix.
-- A `-` argument passes stdin through at that position without wrapping.
+- A `-` argument passes stdin through at that position without wrapping, byte for byte.
+  Stdin is read at most once, so `-` appears once (and it is refused when nothing is
+  piped into `tom`).
 - Each attachment gets a unique random tag ID.
 
-`jerry` remains backwards-compatible: plain text input without tags works exactly as before.
+**`jerry` reads the tags back:** each pair that carries the same ID on both ends becomes
+one content entry — a payload starting with `data:` as `image_url`, anything else as
+`text` — and the text between the pairs keeps its own entry. Anything that is not a matched
+pair is sent as the text it is.
+
+### tom options
+
+| Flag | Meaning |
+| --- | --- |
+| `-q`, `--quiet` | Suppress error messages too |
+| `-h`, `--help` | Show usage and exit |
+| `--version` | Print version and exit |
+
+Input files in order, `-` for stdin, so `tom` takes no options beyond these. Exit codes:
+0 ok, 1 usage error, 130 interrupted; a broken pipe exits 0 silently, as `jerry` does.
+
+With `-e` the input is echoed exactly as `jerry` received it, tags intact, which is what
+makes the round trip possible: feed `jerry -e` back into `jerry` and the tags are read
+again, with the previous answer now part of the text.
 
 ---
 
@@ -167,6 +187,10 @@ jerry: reasoning 268 chars, use -r to see it
    ```
 
 2. **Batching / multiple slots** can make a server non-deterministic even with a seed.
+
+3. **`tom`'s tag IDs are random**, so the text `tom` produces is not byte-identical run to
+   run. `jerry` builds the content from the payload, so the same files send the same
+   request and a run stays reproducible.
 
 There is no client-side response cache: the only cache in play is the server's own prompt/KV cache, so switching the model on the server always gives fresh answers.
 

@@ -137,8 +137,9 @@ def read_input(args):
     return ""
 
 
-# Regex for well-formed <jerry:HEXD> tags
-_TAG_RE = re.compile(r"<jerry:([0-9a-f]{12})>(.*?)</jerry:\1>")
+# Regex for well-formed <jerry:HEXD> tags. DOTALL because tom passes text files
+# through verbatim, so a payload can contain newlines.
+_TAG_RE = re.compile(r"<jerry:([0-9a-f]{12})>(.*?)</jerry:\1>", re.DOTALL)
 
 
 def parse_multimodal(text):
