@@ -33,7 +33,14 @@ import urllib.request
 PROG = "jerry"
 VERSION = "1.0.0"
 
-DEFAULT_URL = os.environ.get("JERRY_URL") or "http://localhost:8080"
+# llama.cpp moved its default port to 9931. 8080 is the port it used before that and
+# is still common, so when nothing is given on the command line or in the environment
+# jerry tries 9931 first and 8080 second. A url from either of those is taken as it is:
+# nobody is consulted twice, and the port that answered is the port the run uses.
+DEFAULT_PORT, FALLBACK_PORT = 9931, 8080
+DEFAULT_URL_FROM_ENV = os.environ.get("JERRY_URL")
+DEFAULT_URL = DEFAULT_URL_FROM_ENV or "http://localhost:%d" % DEFAULT_PORT
+FALLBACK_URL = "http://localhost:%d" % FALLBACK_PORT
 DEFAULT_SEED = int(os.environ.get("JERRY_SEED", "0"))
 DEFAULT_LIMIT = 32768
 DEFAULT_TIMEOUT = float(os.environ.get("JERRY_TIMEOUT", "600"))
@@ -48,7 +55,7 @@ EPILOG = """\
 exit codes: 0 ok, 1 usage error, 2 server error, 3 output limit reached, 4 tool turn limit reached, 130 interrupted
 
 environment:
-  JERRY_URL       server to talk to             (default http://localhost:8080)
+  JERRY_URL       server to talk to             (default http://localhost:9931, else 8080)
   JERRY_MODEL     model name to send            (default: whatever the server reports)
   JERRY_SEED      default seed                  (default 0)
   JERRY_TIMEOUT   socket timeout in seconds     (default 600)
@@ -106,6 +113,18 @@ def report(args, msg):
 # arguments
 # --------------------------------------------------------------------------- #
 
+def url_candidates(given=None, from_env=None):
+    """The urls to try, in the order they should be tried.
+
+    An url from the command line or from the environment is used as given: only the
+    default is a guess, and the guess is the current llama.cpp port first, the old one
+    second.
+    """
+    if given or from_env:
+        return [given or from_env]
+    return ["http://localhost:%d" % DEFAULT_PORT, FALLBACK_URL]
+
+
 class Parser(argparse.ArgumentParser):
     """argparse exits 2 on usage errors, which jerry documents as a server error;
     usage errors are exit code 1."""
@@ -152,7 +171,9 @@ def parse_args(argv):
     ap.add_argument("-o", "--output", help="write the response to a file instead of stdout")
     ap.add_argument("-S", "--system", action="store_true",
                     help="send the text as a system message instead of a user message")
-    ap.add_argument("-u", "--url", default=DEFAULT_URL, help="server url (default %s)" % DEFAULT_URL)
+    ap.add_argument("-u", "--url", default=None,
+                    help="server url (default %s, with %s tried as well when nothing is given here "
+                         "or in JERRY_URL and nothing is running on the default port)" % (DEFAULT_URL, FALLBACK_URL))
     ap.add_argument("-m", "--model", default=os.environ.get("JERRY_MODEL"), help="model name")
     ap.add_argument("-t", "--timeout", type=float, default=DEFAULT_TIMEOUT,
                     help="socket timeout in seconds (default %d)" % DEFAULT_TIMEOUT)
@@ -166,6 +187,10 @@ def parse_args(argv):
     args = ap.parse_args(argv)
     if args.max_turns < 1:
         ap.error("--max-turns must be at least 1")
+
+    # Only the default is a guess; see url_candidates above.
+    args.url_candidates = url_candidates(args.url, DEFAULT_URL_FROM_ENV)
+    args.url = args.url_candidates[0]
     return args
 
 
@@ -643,9 +668,61 @@ def server_report(args, message):
     return EXIT_SERVER
 
 
+class NoServer(Exception):
+    """Nothing answered on any of the ports jerry was willing to try."""
+
+    def __init__(self, attempts):
+        self.attempts = attempts              # [(url, the error that said no)]
+
+
+def nothing_listening(exc):
+    """Whether the error means nobody is listening on that port.
+
+    A timeout does not: something is there and is only slow, and jerry should not walk
+    away from a server it already reached.
+    """
+    return not isinstance(getattr(exc, "reason", exc), TimeoutError)
+
+
+def open_server(args, path, data=None, headers=None):
+    """Open the first url that answers, in the order they should be tried.
+
+    A connection error means nobody is listening there, so the next candidate is tried;
+    an http error, or a timeout, is an answer from a port that is really there, so that
+    url stands. Whatever answered becomes args.url, so the whole run uses one port.
+    """
+    attempts = []
+    for url in args.url_candidates:
+        try:
+            resp = urllib.request.urlopen(urllib.request.Request(url.rstrip("/") + path,
+                                                                  data=data, headers=headers or {}),
+                                          timeout=args.timeout)
+        except urllib.error.HTTPError:
+            args.url = url
+            raise
+        except OSError as exc:
+            attempts.append((url, exc))
+            if not nothing_listening(exc):
+                break                                   # this port is answering, only slowly
+            continue
+        args.url = url
+        return resp
+    raise NoServer(attempts)
+
+
+def unreachable_message(attempts):
+    """The cannot reach line, naming the other ports that were tried as well."""
+    url, exc = attempts[0]
+    line = "cannot reach %s: %s" % (url, exc)
+    rest = [u for u, _ in attempts[1:]]
+    if rest:
+        line += " (nothing answering on %s either)" % ", ".join(rest)
+    return line
+
+
 def http_json(args, path):
     try:
-        with urllib.request.urlopen(args.url.rstrip("/") + path, timeout=args.timeout) as resp:
+        with open_server(args, path) as resp:
             return json.loads(resp.read().decode("utf-8", "replace"))
     except Exception:
         return None
@@ -756,15 +833,10 @@ def take(args, part, data, meter, writer, flush=False):
 
 def run(args, payload, limit, meter, writer):
     """One generation: the whole session, until the model hands control back."""
-    url = args.url.rstrip("/") + "/v1/chat/completions"
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
-    )
-
+    path = "/v1/chat/completions"
     try:
-        resp = urllib.request.urlopen(request, timeout=args.timeout)
+        resp = open_server(args, path, json.dumps(payload).encode("utf-8"),
+                           {"Content-Type": "application/json", "Accept": "text/event-stream"})
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace").strip()
         try:
@@ -772,8 +844,8 @@ def run(args, payload, limit, meter, writer):
         except ValueError:
             pass
         return server_report(args, "http %s: %s" % (exc.code, detail))
-    except (urllib.error.URLError, OSError) as exc:
-        return server_report(args, "cannot reach %s: %s" % (url, exc))
+    except NoServer as exc:
+        return server_report(args, unreachable_message(exc.attempts))
 
     result = new_data()
     meter.turn_tokens = 0
@@ -931,8 +1003,11 @@ def main(argv=None):
 
     try:
         if args.verbose:
-            log(args, "server  %s" % args.url)
-            log(args, "model   %s" % model_name(args))
+            model = model_name(args)          # the first request decides which port was meant
+            fell_back = args.url != args.url_candidates[0]
+            log(args, "server  %s%s" % (args.url, " (nothing answering on %s)" % args.url_candidates[0]
+                                        if fell_back else ""))
+            log(args, "model   %s" % model)
             log(args, "seed    %d%s" % (seed, " (random)" if seed_is_random else ""))
             log(args, "limit   %s tokens" % ("none (-b)" if not output_limit(args) else output_limit(args)))
             log(args, "reasoning %s" % ("off (-f)" if args.fast else "hidden"))

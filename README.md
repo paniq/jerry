@@ -97,7 +97,7 @@ again, with the previous answer now part of the text.
 | `-i`, `--input` FILE | Read text from a file (`-` means stdin) |
 | `-o`, `--output` FILE | Write response to a file instead of stdout |
 | `-S`, `--system` | Send text as a system message instead of user |
-| `-u`, `--url` URL | Server URL, default `http://localhost:8080` |
+| `-u`, `--url` URL | Server URL, default `http://localhost:9931` (with `http://localhost:8080` as a fallback, see below) |
 | `-m`, `--model` NAME | Model name to send |
 | `-t`, `--timeout` S | Socket timeout in seconds, default 600 (`JERRY_TIMEOUT`) |
 | `--limit` N | Explicit output token limit (overrides the default) |
@@ -110,6 +110,15 @@ again, with the previous answer now part of the text.
 
 **Input sources**, in order of precedence: `-i FILE` → positional argument → stdin.
 
+### Ports
+
+llama.cpp's default port is `9931`; `8080` is the port it used before that and is still
+common. When neither `-u` nor `JERRY_URL` is set, jerry tries `9931` first and falls back on
+`8080` if nothing is listening there, and the port that answers is the one the run uses. A
+url given on the command line or in the environment is used as it is, nothing else is ever
+consulted, and a port that answers slowly is not passed over: only a refused connection moves
+on to the next one.
+
 ---
 
 ## Environment
@@ -119,7 +128,7 @@ configured once:
 
 | Variable | Default for | Fallback |
 | --- | --- | --- |
-| `JERRY_URL` | `-u`, `--url` | `http://localhost:8080` |
+| `JERRY_URL` | `-u`, `--url` | `http://localhost:9931`, then `http://localhost:8080` |
 | `JERRY_MODEL` | `-m`, `--model` | whatever the server reports |
 | `JERRY_SEED` | `-s`, `--seed` | `0` |
 | `JERRY_TIMEOUT` | `-t`, `--timeout` | `600` |
@@ -150,7 +159,7 @@ jerry: output limit reached (32768 tokens), the response is incomplete; use -b f
 ## Verbose output (`-v`)
 
 ```
-jerry: server  http://localhost:8080
+jerry: server  http://localhost:9931
 jerry: model   qwen3.8-flash-next-iq2_xs
 jerry: seed    0
 jerry: limit   32768 tokens
@@ -162,6 +171,13 @@ jerry: finish  stop
 jerry: prompt  63 tokens (36.4 t/s)
 jerry: output  94 tokens (29.7 t/s) first token 1.79s
 jerry: reasoning 268 chars, use -r to see it
+```
+
+With `-v` the server line names the port that answered, and says which one answered nothing
+when the run had to fall back on the other:
+
+```
+jerry: server  http://localhost:8080 (nothing answering on http://localhost:9931)
 ```
 
 ---

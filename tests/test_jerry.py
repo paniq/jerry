@@ -314,7 +314,8 @@ class TestReadmeSpec(unittest.TestCase):
 
     def test_documented_defaults(self):
         r = subprocess.run([JERRY, "--help"], capture_output=True, text=True)
-        self.assertIn("http://localhost:8080", r.stdout)
+        self.assertIn("http://localhost:9931", r.stdout)
+        self.assertIn("http://localhost:8080", r.stdout)      # documented as the fallback
         self.assertIn("32768", r.stdout)
         self.assertIn("600", r.stdout)
 
@@ -669,8 +670,10 @@ class TestWhatJerrySends(unittest.TestCase):
 
     def test_defaults_of_timeout_and_url(self):
         self.assertEqual(JERRY_MOD.parse_args([]).timeout, 600.0)
-        self.assertEqual(load_jerry({"JERRY_URL": "http://example.test:1"}).parse_args([]).url,
-                         "http://example.test:1")
+        mod = load_jerry({"JERRY_URL": "http://example.test:1"})
+        self.assertEqual(mod.parse_args([]).url, "http://example.test:1")
+        self.assertEqual(mod.parse_args([]).url_candidates, ["http://example.test:1"],
+                         "a url from the environment or from the command line has no fallback")
 
 
 # --------------------------------------------------------------------------- #
@@ -1045,6 +1048,15 @@ LONG = "write a short story about a key, three sentences"
 
 
 class TestLive(LiveCase):
+
+    def test_the_default_ports_are_tried_in_that_order(self):
+        """llama.cpp moved to 9931, 8080 stays as the fallback of the default."""
+        self.assertEqual(JERRY_MOD.url_candidates(), ["http://localhost:9931", "http://localhost:8080"])
+        args = JERRY_MOD.parse_args([])
+        args.url_candidates = ["http://127.0.0.1:9/", SERVER]      # nothing on the first port
+        args.url = args.url_candidates[0]
+        JERRY_MOD.open_server(args, "/v1/models").read()
+        self.assertEqual(args.url, SERVER, "a port that answers nothing should be passed over")
 
     def test_plain_run_prints_only_the_response(self):
         r = Run([PROMPT], stdin=PROMPT).assert_ok()

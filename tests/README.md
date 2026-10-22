@@ -56,6 +56,8 @@ themselves with `--server`.
 * `-e`, `-f`, `-S`, `-s` (fixed / `-s N` / bare `-s` random), `JERRY_SEED`, `-i`, `-o`
 * input precedence `-i FILE`, positional, stdin
 * `--no-stream`, `-m`, `-u`, `-t`, `--limit`, `-q`, `--version`, `--help` flags
+* default ports tried in order, 9931 then 8080, with the first one that answers kept, and
+  no fallback for a url given on the command line or in the environment
 * request payload: seed on every request, default limit 32768, no temperature /
   top_k / vendor settings, one message only, `/v1/chat/completions` + `/v1/models`
   only, standard library only, no client side cache, tools only sent when a module
@@ -98,7 +100,7 @@ rather than the whole run.
 
 ## Observed result
 
-156 tests against the mock, all pass, none skipped (about 30 seconds).
+157 tests against the mock, all pass, none skipped (about 30 seconds).
 
 `jerry` bugs, both fixed since:
 
