@@ -10,6 +10,7 @@ depend on the prompt:
     "story"                     a 200 token answer, so the run takes a couple of seconds
     "call the tool"             a tool call, finish_reason "tool_calls"
     "call the tool again"       a tool call every turn, so the run keeps going
+    "what temperature did you send"  what the request carried, so a test can see it arrived
     a turn that already carries a tool result  "tool said: <what jerry fed back>", or, when the
                                         prompt asks for it, the roles of the messages it was sent
     anything else               "mock reply for: <prompt>"
@@ -118,6 +119,10 @@ def plan(prompt, req, messages=()):
             return [], ["message %d: %s\n" % (i, m.get("role") or "?")
                         for i, m in enumerate(messages)], None
         return [], ["tool said: " + results[0]], None
+    if "what temperature" in low:
+        # what the request carried: nothing sent means the server's own setting was used
+        value = req.get("temperature")
+        return [], ["temperature: %s\n" % ("nothing sent" if value is None else value)], None
     if "story" in low:
         return reasoning, [STORY[i % len(STORY)] + " " for i in range(200)], None
     return reasoning, re.findall(r"\S+\s*", "mock reply for: " + prompt[:100]), None

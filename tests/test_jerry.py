@@ -429,6 +429,26 @@ class TestReadmeSpec(unittest.TestCase):
             JERRY_MOD.report(JERRY_MOD.parse_args([]), "shown message")
         self.assertEqual(buf.getvalue(), "jerry: shown message\n")
 
+    def test_a_negative_temperature_is_a_usage_error(self):
+        """0 (greedy) is allowed, anything below it is not."""
+        r = Run(["--temperature", "-1", "hi there"], stdin="")
+        self.assertEqual(r.code, EXIT_USAGE)
+        self.assertIn("--temperature must be 0 or more", r.err.decode())
+
+    def test_a_jerry_temperature_that_is_not_a_number_is_a_usage_error(self):
+        """A default that cannot be read leaves exit 1, not a traceback, the way the other
+        environment defaults would have to be read at import to do the same."""
+        r = Run(["hi there"], stdin="", env={"JERRY_TEMPERATURE": "warm"})
+        self.assertEqual(r.code, EXIT_USAGE)
+        self.assertIn("JERRY_TEMPERATURE is not a number", r.err.decode())
+
+    def test_the_environment_variables_in_the_readme_are_the_ones_jerry_reads(self):
+        with open(README) as fh:
+            documented = set(re.findall(r"^\| `(JERRY_[A-Z_]+)`", fh.read(), re.M))
+        with open(JERRY) as fh:
+            read = set(re.findall(r"JERRY_[A-Z_]+", fh.read()))
+        self.assertEqual(documented, read, "the README environment table and the code must agree")
+
 
 # --------------------------------------------------------------------------- #
 # tom: the tag writer
@@ -615,12 +635,47 @@ class TestWhatJerrySends(unittest.TestCase):
         self.assertIs(JERRY_MOD.build_payload(JERRY_MOD.parse_args(["-f"]), [], 0)[0].get("enable_thinking"),
                       False)
 
-    def test_nothing_else_that_could_change_the_answer_is_touched(self):
+    def test_nothing_that_could_change_the_answer_is_touched_on_its_own(self):
+        """The request is what was asked for and nothing more: no temperature, no top_k,
+        no vendor settings, and a temperature only when --temperature was given."""
         payload, _ = JERRY_MOD.build_payload(JERRY_MOD.parse_args([]), [{"role": "user", "content": "x"}], 0)
         for key in ("temperature", "top_k", "top_p", "min_p", "penalty", "grammar", "json_schema",
                     "reasoning_effort", "n", "stop", "cache"):
             self.assertNotIn(key, payload, "jerry should not send %s" % key)
         self.assertEqual(sorted(payload), ["max_tokens", "messages", "seed", "stream"])
+
+    def test_temperature_is_only_sent_when_it_was_asked_for(self):
+        """No temperature means the server's own setting decides, so by default jerry sends
+        no temperature at all; an unset temperature is not the same request as 0."""
+        args = JERRY_MOD.parse_args([])
+        self.assertIsNone(args.temperature)
+        self.assertNotIn("temperature", JERRY_MOD.build_payload(args, [], 0)[0])
+
+    def test_temperature_given_on_the_command_line_is_sent(self):
+        payload, _ = JERRY_MOD.build_payload(JERRY_MOD.parse_args(["--temperature", "0.8"]), [], 0)
+        self.assertEqual(payload["temperature"], 0.8)
+
+    def test_temperature_zero_is_sent_as_zero(self):
+        """0 is greedy sampling, so it has to arrive as 0 and not as nothing."""
+        payload, _ = JERRY_MOD.build_payload(JERRY_MOD.parse_args(["--temperature", "0"]), [], 0)
+        self.assertEqual(payload["temperature"], 0.0)
+
+    def test_temperature_is_sent_on_every_turn_of_a_tool_run(self):
+        """build_payload is called once per turn, so a setting is not lost after the first."""
+        payload, _ = JERRY_MOD.build_payload(JERRY_MOD.parse_args(["--temperature", "0.5"]), [], 0,
+                                            registry_of(TOOLMOD))
+        self.assertEqual(payload["temperature"], 0.5)
+
+    def test_jerry_temperature_is_the_default_for_temperature(self):
+        self.assertEqual(load_jerry({"JERRY_TEMPERATURE": "0.7"}).parse_args([]).temperature, 0.7)
+
+    def test_an_empty_jerry_temperature_is_not_a_default(self):
+        self.assertIsNone(load_jerry({"JERRY_TEMPERATURE": ""}).parse_args([]).temperature,
+                          "an empty value sends nothing, as the default is nothing")
+
+    def test_the_command_line_beats_jerry_temperature(self):
+        mod = load_jerry({"JERRY_TEMPERATURE": "0.7"})
+        self.assertEqual(mod.parse_args(["--temperature", "0.2"]).temperature, 0.2)
 
     def test_session_is_exactly_one_message(self):
         self.assertEqual(JERRY_MOD.build_messages(JERRY_MOD.parse_args([]), "the quick brown fox"),
@@ -1139,6 +1194,19 @@ class TestLive(LiveCase):
     def test_big_run_is_not_cut_off(self):
         self.assertTrue(Run(["-b", PROMPT], stdin=PROMPT).assert_ok().out.strip())
 
+    def test_the_temperature_reaches_the_server_only_when_it_was_given(self):
+        """The mock reports what the request carried, which is the whole point of a default
+        that sends nothing: the server's own temperature stays in charge."""
+        if SERVER != MOCK_URL:
+            self.skipTest("the proof is the mock saying what it was sent")
+        prompt = "what temperature did you send?"
+        r = Run([prompt], stdin=prompt).assert_ok()
+        self.assertIn("temperature: nothing sent", r.out.decode())
+        r = Run(["--temperature", "0.8", prompt], stdin=prompt).assert_ok()
+        self.assertIn("temperature: 0.8", r.out.decode())
+        r = Run(["--temperature", "0", prompt], stdin=prompt).assert_ok()
+        self.assertIn("temperature: 0.0", r.out.decode(), "greedy sampling, sent as itself")
+
     def test_input_from_a_file(self):
         path = os.path.join(ROOT, "tests", ".tmp_in.txt")
         with open(path, "w") as fh:
@@ -1271,6 +1339,14 @@ class TestVerboseMeter(LiveCase):
         self.assertEqual(lines[3], "jerry: limit   32768 tokens")
         self.assertEqual(lines[4], "jerry: reasoning hidden")
         self.assertEqual(lines[5], "jerry: input   %d chars as user message" % len(PROMPT))
+
+    def test_no_temperature_line_for_a_setting_jerry_did_not_send(self):
+        self.assertNotIn("jerry: temp", Run(["-v", PROMPT], stdin=PROMPT).assert_ok().err.decode(),
+                         "nothing is reported for a setting the server decides on its own")
+
+    def test_temperature_line_after_the_seed_when_a_temperature_was_given(self):
+        lines = Run(["-v", "--temperature", "0.8", PROMPT], stdin=PROMPT).assert_ok().stderr_lines()
+        self.assertEqual(lines[3], "jerry: temp    0.8", "the header line is the one in the README")
 
     def test_summary_lines_match_the_readme_example(self):
         text = Run(["-v", PROMPT], stdin=PROMPT).assert_ok().err.decode("utf-8", "replace")

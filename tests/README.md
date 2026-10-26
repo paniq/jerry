@@ -21,7 +21,8 @@ purpose, so a server configured for daily use is never hit by accident. With
 `mock_server.py` speaks `GET /v1/models` and `POST /v1/chat/completions`, streaming
 (SSE) or plain JSON, with canned deterministic answers chosen by the prompt:
 `List the numbers 1 to N`, anything with `story` (a 200 token answer, slow enough
-to interrupt), `call the tool` (a tool call), or a short `mock reply for: ...`.
+to interrupt), `call the tool` (a tool call), `what temperature did you send` (what the request
+carried, which is how a test can see that the field arrived), or a short `mock reply for: ...`.
 Answers start with 12 reasoning tokens unless `enable_thinking` is false, reasoning
 counts towards `max_tokens`, and an answer that does not fit ends with
 `finish_reason: length`. `usage` and `timings` are sent so the `-v` summary can be
@@ -49,19 +50,25 @@ themselves with `--server`.
 * stdout is the raw response only, ends with a newline, nothing on stderr by default
 * exit codes: 0 / 1 usage / 2 server / 3 limit / 130 interrupted
 * the limit message is the one printed in the README, `-q` keeps the exit code
-* `-v` header and summary lines, meter line format, `-b` meter (`N tokens (no limit)`)
+* `-v` header and summary lines, meter line format, `-b` meter (`N tokens (no limit)`), and the
+  `temp` header line only when a temperature was given
 * meter owns stderr on a terminal (answer printed once, after the run); streamed
   live when stderr is a pipe
 * `-r` to stderr, reasoning never on stdout, the `use -r to see it` line
 * `-e`, `-f`, `-S`, `-s` (fixed / `-s N` / bare `-s` random), `JERRY_SEED`, `-i`, `-o`
+* `--temperature`: sent only when it was asked for, so by default the server's own setting
+  decides; `JERRY_TEMPERATURE` is the default for it, `0` is sent as `0` and not as nothing, an
+  empty one is no default, a negative one or a value that is not a number is a usage error, the
+  command line beats the environment, and the value is sent on every turn of a tool run
 * input precedence `-i FILE`, positional, stdin
 * `--no-stream`, `-m`, `-u`, `-t`, `--limit`, `-q`, `--version`, `--help` flags
 * default ports tried in order, 9931 then 8080, with the first one that answers kept, and
   no fallback for a url given on the command line or in the environment
-* request payload: seed on every request, default limit 32768, no temperature /
-  top_k / vendor settings, one message only, `/v1/chat/completions` + `/v1/models`
-  only, standard library only, no client side cache, tools only sent when a module
-  was given and only in name order
+* request payload: seed on every request, default limit 32768, nothing that was not asked for
+  (no top_k / top_p / vendor settings, and no temperature unless it was given), one message only,
+  `/v1/chat/completions` + `/v1/models` only, standard library only, no client side cache, tools
+  only sent when a module was given and only in name order, and the environment variables
+  documented in the README are the ones jerry reads
 * broken pipe, SIGINT, command substitution / pipes, determinism (skipped when the
   server does not honour the seed, as the README says it may not)
 
@@ -100,7 +107,7 @@ rather than the whole run.
 
 ## Observed result
 
-157 tests against the mock, all pass, none skipped (about 30 seconds).
+170 tests against the mock, all pass, none skipped (about 30 seconds).
 
 `jerry` bugs, both fixed since:
 

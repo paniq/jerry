@@ -94,6 +94,7 @@ again, with the previous answer now part of the text.
 | `-b`, `--big` | No output token limit (default: 32 768) |
 | `-e`, `--echo` | Print input + response as one (don't clip) |
 | `-s`, `--seed` `[N]` | Seed; fixed by default (0), no arg picks random |
+| `--temperature` `T` | Sampling temperature; nothing is sent unless given here or in `JERRY_TEMPERATURE`, so the server's own setting decides (`0` = greedy) |
 | `-i`, `--input` FILE | Read text from a file (`-` means stdin) |
 | `-o`, `--output` FILE | Write response to a file instead of stdout |
 | `-S`, `--system` | Send text as a system message instead of user |
@@ -131,6 +132,7 @@ configured once:
 | `JERRY_URL` | `-u`, `--url` | `http://localhost:9931`, then `http://localhost:8080` |
 | `JERRY_MODEL` | `-m`, `--model` | whatever the server reports |
 | `JERRY_SEED` | `-s`, `--seed` | `0` |
+| `JERRY_TEMPERATURE` | `--temperature` | nothing sent, so the server decides |
 | `JERRY_TIMEOUT` | `-t`, `--timeout` | `600` |
 | `JERRY_TOOL_LOG` | `-L`, `--log` | no log |
 | `JERRY_MAX_TURNS` | `--max-turns` | `8` |
@@ -180,6 +182,16 @@ when the run had to fall back on the other:
 jerry: server  http://localhost:8080 (nothing answering on http://localhost:9931)
 ```
 
+A run that was given `--temperature` gets a `temp` line after the seed, naming what was sent;
+a run that was not gets no line at all, because jerry sent nothing and the server's own setting
+is what answered:
+
+```
+jerry: seed    0
+jerry: temp    0.8
+jerry: limit   32768 tokens
+```
+
 ---
 
 ## Exit codes
@@ -202,6 +214,22 @@ jerry: server  http://localhost:8080 (nothing answering on http://localhost:9931
 - Default: `0`
 - Environment variable: `JERRY_SEED`
 - Per-run override: `-s N` (use `-s` alone for a random seed)
+
+and sends nothing that could change the answer unless it was asked for: no `top_k`, no `top_p`,
+no penalty, no vendor settings, no `temperature`. What the server was started with decides
+those, and none of it is part of the request, so the same prompt on a server configured
+differently is not the same run.
+
+### Temperature
+
+`--temperature` is the one sampling setting `jerry` will send, and only when it is given:
+
+- Default: nothing sent, so the server's own setting is what answers
+- Environment variable: `JERRY_TEMPERATURE`
+- Per-run override: `--temperature N` (`0` is greedy sampling, and is sent as `0`, not as nothing)
+
+A run that names a seed and a temperature is the same request every time; whether the answer is
+the same is up to the server, see the caveats below.
 
 ### Caveats
 

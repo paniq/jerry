@@ -7,7 +7,9 @@ A single-shot, pipe friendly client for a llama.cpp server:
     echo hello! tell me a story | jerry # same, the piped text is what is sent
 
 The session is empty apart from the text it is given, the model is run until it
-returns control to the user, and the raw response is printed on stdout.
+returns control to the user, and the raw response is printed on stdout. Nothing that
+could change the answer is sent unless it was asked for: the seed, and a sampling
+temperature only when --temperature or JERRY_TEMPERATURE gives one.
 
 With -T MODULE.py the model may ask for a tool instead of answering: every tool_
 function in that module is offered to the server, the call is run, and what it
@@ -31,7 +33,7 @@ import urllib.error
 import urllib.request
 
 PROG = "jerry"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 # llama.cpp moved its default port to 9931. 8080 is the port it used before that and
 # is still common, so when nothing is given on the command line or in the environment
@@ -46,6 +48,7 @@ DEFAULT_LIMIT = 32768
 DEFAULT_TIMEOUT = float(os.environ.get("JERRY_TIMEOUT", "600"))
 DEFAULT_TOOL_LOG = os.environ.get("JERRY_TOOL_LOG") or None
 DEFAULT_MAX_TURNS = int(os.environ.get("JERRY_MAX_TURNS", "8"))
+DEFAULT_TEMPERATURE = os.environ.get("JERRY_TEMPERATURE") or None   # nothing, so the server decides
 
 EXIT_OK, EXIT_USAGE, EXIT_SERVER, EXIT_LIMIT, EXIT_TOOL, EXIT_KILLED = 0, 1, 2, 3, 4, 130
 
@@ -55,12 +58,13 @@ EPILOG = """\
 exit codes: 0 ok, 1 usage error, 2 server error, 3 output limit reached, 4 tool turn limit reached, 130 interrupted
 
 environment:
-  JERRY_URL       server to talk to             (default http://localhost:9931, else 8080)
-  JERRY_MODEL     model name to send            (default: whatever the server reports)
-  JERRY_SEED      default seed                  (default 0)
-  JERRY_TIMEOUT   socket timeout in seconds     (default 600)
-  JERRY_TOOL_LOG  file to append tool calls to  (default: none)
-  JERRY_MAX_TURNS tool turns per run            (default 8)
+  JERRY_URL           server to talk to             (default http://localhost:9931, else 8080)
+  JERRY_MODEL         model name to send            (default: whatever the server reports)
+  JERRY_SEED          default seed                  (default 0)
+  JERRY_TEMPERATURE   sampling temperature          (default: nothing sent, the server's own)
+  JERRY_TIMEOUT       socket timeout in seconds     (default 600)
+  JERRY_TOOL_LOG      file to append tool calls to  (default: none)
+  JERRY_MAX_TURNS     tool turns per run            (default 8)
 
 tool calling: see TOOLS.md
 
@@ -70,6 +74,7 @@ examples:
   cat instructions.txt | jerry -v -r
   jerry -s "tell me a story"                 # random seed, one off answer
   jerry -s 1234 "tell me a story"            # the same story every time
+  jerry --temperature 0.8 "tell me a story"   # sent, because it was asked for
   echo "what is the weather in Paris?" | jerry -T tools/weather.py -v
 """
 
@@ -112,6 +117,26 @@ def report(args, msg):
 # --------------------------------------------------------------------------- #
 # arguments
 # --------------------------------------------------------------------------- #
+
+def default_temperature(ap, raw):
+    """JERRY_TEMPERATURE as the number it should have been.
+
+    Temperature is the only default that can be nothing, and nothing is what it is: the server's
+    own setting decides. So an empty JERRY_TEMPERATURE is not a default, while 0 is one like any
+    other (greedy sampling, and it has to arrive as 0, not as nothing).
+
+    It is read as a string at import, the way the other defaults are, and checked here rather than
+    there: a value that is not a number is no default at all, and the message should name the
+    variable, not an argument nobody gave, with exit 1 rather than a traceback. That is also why
+    the flag has no default of its own: argparse would have converted the string before this ran.
+    """
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        ap.error("JERRY_TEMPERATURE is not a number: %s" % raw)
+
 
 def url_candidates(given=None, from_env=None):
     """The urls to try, in the order they should be tried.
@@ -157,6 +182,10 @@ def parse_args(argv):
     ap.add_argument("-s", "--seed", nargs="?", type=int, const=None, default=DEFAULT_SEED,
                     help="seed, fixed by default so the same input can give the same output "
                          "(on servers that honour it); no argument picks a random one")
+    ap.add_argument("--temperature", type=float, metavar="T",
+                    help="sampling temperature to send; nothing is sent unless it is given here "
+                         "or in JERRY_TEMPERATURE, so the server's own setting applies "
+                         "(0 is greedy sampling)")
 
     # tools (see TOOLS.md)
     ap.add_argument("-T", "--tool", action="append", metavar="MODULE.py",
@@ -187,6 +216,10 @@ def parse_args(argv):
     args = ap.parse_args(argv)
     if args.max_turns < 1:
         ap.error("--max-turns must be at least 1")
+    if args.temperature is None:
+        args.temperature = default_temperature(ap, DEFAULT_TEMPERATURE)   # nothing was given
+    if args.temperature is not None and args.temperature < 0:
+        ap.error("--temperature must be 0 or more")
 
     # Only the default is a guess; see url_candidates above.
     args.url_candidates = url_candidates(args.url, DEFAULT_URL_FROM_ENV)
@@ -744,6 +777,10 @@ def output_limit(args):
 def build_payload(args, messages, seed, registry=None):
     limit = output_limit(args)
     payload = {"messages": messages, "stream": not args.no_stream, "seed": seed}
+    if args.temperature is not None:
+        # nothing that could change the answer is sent unless it was asked for; without a
+        # temperature the server uses the one it was started with
+        payload["temperature"] = args.temperature
     if args.model:
         payload["model"] = args.model
     if limit:
@@ -1009,6 +1046,8 @@ def main(argv=None):
                                         if fell_back else ""))
             log(args, "model   %s" % model)
             log(args, "seed    %d%s" % (seed, " (random)" if seed_is_random else ""))
+            if args.temperature is not None:
+                log(args, "temp    %s" % args.temperature)
             log(args, "limit   %s tokens" % ("none (-b)" if not output_limit(args) else output_limit(args)))
             log(args, "reasoning %s" % ("off (-f)" if args.fast else "hidden"))
             log(args, "input   %d chars as %s message" % (len(text), "system" if args.system else "user"))
